@@ -22,6 +22,6 @@
 ### 💬 交流与反馈
 - TG 频道：https://t.me/MasterAlanLab
 - 技术问题：提 Issue；
-- 合作/建议：平台私信或留言。
+- 商务合作：masteralanlab@gmail.com
 
 如果对你有帮助，记得点个 ⭐ 支持一下！
