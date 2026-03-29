@@ -27,6 +27,29 @@ except ImportError:
 from curl_cffi import requests
 
 OUT_DIR = Path(__file__).parent.resolve()
+
+# ========== 自动加载 .env 文件（无需 python-dotenv）==========
+def _load_dotenv(env_path: Path):
+    if not env_path.is_file():
+        return
+    with env_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            # 去掉引号包裹
+            if len(val) >= 2 and val[0] in ('"', "'") and val[-1] == val[0]:
+                val = val[1:-1]
+            else:
+                # 无引号时裁掉行内注释（空格+#开头）
+                val = val.split(" #")[0].split("\t#")[0].strip()
+            if key and key not in os.environ:  # 不覆盖已有的环境变量
+                os.environ[key] = val
+
+_load_dotenv(OUT_DIR / ".env")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 AUTH_URL = "https://auth.openai.com/oauth/authorize"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -39,6 +62,202 @@ SUB2API_ADMIN_API_KEY = str(os.getenv("SUB2API_ADMIN_API_KEY") or "").strip()
 SUB2API_BEARER = str(os.getenv("SUB2API_BEARER") or "").strip()
 SUB2API_EMAIL = str(os.getenv("SUB2API_EMAIL") or "").strip()
 SUB2API_PASSWORD = str(os.getenv("SUB2API_PASSWORD") or "").strip()
+
+# ========== 自定义域名邮箱配置 ==========
+CUSTOM_EMAIL_DOMAIN = str(os.getenv("CUSTOM_EMAIL_DOMAIN") or "").strip()
+CUSTOM_EMAIL_SUFFIX = str(os.getenv("CUSTOM_EMAIL_SUFFIX") or "").strip()
+CUSTOM_EMAIL_RANDOM_LENGTH = max(4, int(os.getenv("CUSTOM_EMAIL_RANDOM_LENGTH") or "6"))
+QQ_IMAP_HOST = str(os.getenv("QQ_IMAP_HOST") or "imap.qq.com").strip()
+QQ_IMAP_PORT = int(os.getenv("QQ_IMAP_PORT") or "993")
+QQ_IMAP_USER = str(os.getenv("QQ_IMAP_USER") or "").strip()
+QQ_IMAP_PASS = str(os.getenv("QQ_IMAP_PASS") or "").strip()
+QQ_IMAP_FOLDER = str(os.getenv("QQ_IMAP_FOLDER") or "INBOX").strip()
+
+# ========== 运行时行为全局配置（均可通过 .env 配置，CLI 参数优先） ==========
+DEFAULT_EMAIL_TIMEOUT = int(os.getenv("EMAIL_TIMEOUT") or "900")
+DEFAULT_OTP_RESEND_INTERVAL = int(os.getenv("OTP_RESEND_INTERVAL") or "300")
+DEFAULT_SLEEP_MIN = int(os.getenv("SLEEP_MIN") or "5")
+DEFAULT_SLEEP_MAX = int(os.getenv("SLEEP_MAX") or "30")
+DEFAULT_MAIL_PROVIDER = str(os.getenv("MAIL_PROVIDER") or "auto").strip().lower()
+DEFAULT_PROXY = str(os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
+
+# ========== 自定义域名邮箱客户端（Cloudflare → QQ IMAP） ==========
+import imaplib
+import email as _email_lib
+from email.header import decode_header as _decode_header
+
+
+def _decode_mime_str(raw) -> str:
+    """解码 MIME 编码的头字段（Subject/From/To 等）"""
+    if not raw:
+        return ""
+    parts = []
+    for byt, enc in _decode_header(str(raw)):
+        if isinstance(byt, bytes):
+            try:
+                parts.append(byt.decode(enc or "utf-8", errors="replace"))
+            except Exception:
+                parts.append(byt.decode("utf-8", errors="replace"))
+        else:
+            parts.append(str(byt))
+    return " ".join(parts)
+
+
+class CustomDomainMailClient:
+    """通过 IMAP 读取 QQ 邮箱中 Cloudflare 转发的验证码邮件。"""
+
+    def __init__(
+        self,
+        domain: str = "",
+        suffix: str = "",
+        random_length: int = 6,
+        imap_host: str = "imap.qq.com",
+        imap_port: int = 993,
+        imap_user: str = "",
+        imap_pass: str = "",
+        imap_folder: str = "INBOX",
+    ):
+        self.domain = (domain or CUSTOM_EMAIL_DOMAIN).strip().lstrip("@")
+        self.suffix = (suffix or CUSTOM_EMAIL_SUFFIX).strip()
+        self.random_length = random_length or CUSTOM_EMAIL_RANDOM_LENGTH
+        self.imap_host = imap_host or QQ_IMAP_HOST
+        self.imap_port = imap_port or QQ_IMAP_PORT
+        self.imap_user = imap_user or QQ_IMAP_USER
+        self.imap_pass = imap_pass or QQ_IMAP_PASS
+        self.imap_folder = imap_folder or QQ_IMAP_FOLDER
+
+        if not self.domain:
+            raise ValueError("CUSTOM_EMAIL_DOMAIN 未配置")
+        if not self.imap_user or not self.imap_pass:
+            raise ValueError("QQ_IMAP_USER / QQ_IMAP_PASS 未配置")
+
+    def generate_email(self) -> str:
+        """生成 {随机N位字母数字}{suffix}@domain 格式邮箱"""
+        chars = string.ascii_lowercase + string.digits
+        rand_part = "".join(random.choices(chars, k=self.random_length))
+        local = f"{rand_part}{self.suffix}" if self.suffix else rand_part
+        addr = f"{local}@{self.domain}"
+        suffix_label = f"{self.suffix}" if self.suffix else "(无后缀)"
+        print(f"[+] 自定义邮箱: {addr}  (随机={rand_part}, 后缀={suffix_label})")
+        return addr
+
+    def _fetch_folder_msgs(self, conn: imaplib.IMAP4_SSL, folder: str, n: int) -> List[_email_lib.message.Message]:
+        """从指定文件夹取最新 n 封邮件"""
+        msgs: List[_email_lib.message.Message] = []
+        try:
+            status, _ = conn.select(folder, readonly=True)
+            if status != "OK":
+                return msgs
+            _, data = conn.search(None, "ALL")
+            all_ids = (data[0] or b"").split()
+            target_ids = list(reversed(all_ids[-n:]))  # 最新在前
+            for uid in target_ids:
+                _, msg_data = conn.fetch(uid, "(RFC822)")
+                for part in msg_data:
+                    if isinstance(part, tuple):
+                        msg = _email_lib.message_from_bytes(part[1])
+                        msgs.append(msg)
+        except Exception as e:
+            print(f"[custom-imap] 文件夹 {folder!r} 读取失败: {e}")
+        return msgs
+
+    def _fetch_latest_msgs(self, n: int = 30) -> List[_email_lib.message.Message]:
+        """同时取 INBOX 和垃圾邮件文件夹最新 n 封（最新在前）"""
+        msgs: List[_email_lib.message.Message] = []
+        # QQ 邮箱垃圾箱候选文件夹名
+        spam_folders = ["Junk", "垃圾邮件", "Spam", "SPAM", "Bulk Mail"]
+        try:
+            conn = imaplib.IMAP4_SSL(self.imap_host, self.imap_port)
+            conn.login(self.imap_user, self.imap_pass)
+            try:
+                # 主收件箱
+                msgs.extend(self._fetch_folder_msgs(conn, self.imap_folder, n))
+                # 垃圾邮件文件夹（逐个尝试）
+                for folder in spam_folders:
+                    extra = self._fetch_folder_msgs(conn, folder, n)
+                    if extra:
+                        print(f"[custom-imap] 垃圾箱 {folder!r} 中额外找到 {len(extra)} 封邮件")
+                        msgs.extend(extra)
+                        break
+            finally:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[custom-imap] IMAP 连接/读取失败: {e}")
+        return msgs
+
+    @staticmethod
+    def _get_body(msg: _email_lib.message.Message) -> str:
+        """递归提取邮件纯文本正文"""
+        parts = []
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct in ("text/plain", "text/html"):
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        parts.append(payload.decode(charset, errors="replace"))
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                parts.append(payload.decode(charset, errors="replace"))
+        return " ".join(parts)
+
+    def _msg_targets_email(self, msg: _email_lib.message.Message, target_email: str) -> bool:
+        """检查邮件是否发给 target_email（To / Delivered-To / X-Forwarded-To / Envelope-To 等头）"""
+        target_lower = target_email.lower()
+        check_headers = ["To", "Delivered-To", "X-Forwarded-To", "Envelope-To", "X-Original-To", "Cc"]
+        for h in check_headers:
+            val = _decode_mime_str(msg.get(h, "")).lower()
+            if target_lower in val:
+                return True
+        # 保底：正文中出现目标邮址也算（应对转发头被完全改写的情况）
+        body = self._get_body(msg).lower()
+        if target_lower in body:
+            return True
+        return False
+
+    def extract_codes_for(self, target_email: str, n: int = 30) -> List[str]:
+        """取最新 n 封邮件，返回发给 target_email 的所有 6 位验证码列表"""
+        codes: List[str] = []
+        msgs = self._fetch_latest_msgs(n)
+        for msg in msgs:
+            fr = _decode_mime_str(msg.get("From", ""))
+            subj = _decode_mime_str(msg.get("Subject", ""))
+            if not self._msg_targets_email(msg, target_email):
+                continue
+            body = self._get_body(msg)
+            text = f"{subj} {body}"
+            found = re.findall(r"(?<!\d)(\d{6})(?!\d)", text)
+            if found:
+                print(f"[custom-imap] ✅ 命中: From={fr[:50]} Subject={subj[:60]} codes={found}")
+            codes.extend(found)
+        return codes
+
+    def fetch_code(
+        self,
+        target_email: str,
+        timeout_sec: int = 180,
+        poll: float = 6.0,
+        exclude_codes: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        exclude = set(exclude_codes or [])
+        start = time.monotonic()
+        attempt = 0
+        while time.monotonic() - start < timeout_sec:
+            attempt += 1
+            codes = self.extract_codes_for(target_email)
+            print(f"[otp][custom] 轮询 #{attempt}, 共匹配 {len(codes)} 个候选码, 收件目标: {target_email}")
+            for code in codes:
+                if code not in exclude:
+                    return code
+            time.sleep(poll)
+        return None
+
 
 # ========== 临时邮箱提供商：GPTMail + TempMail.lol ==========
 
@@ -117,8 +336,24 @@ class EMail:
 
 def get_email_and_code_fetcher(proxies: Any = None, provider: str = "auto"):
     provider = (provider or "auto").strip().lower()
-    if provider not in {"auto", "gptmail", "tempmail"}:
+    if provider not in {"auto", "gptmail", "tempmail", "custom"}:
         raise ValueError(f"不支持的邮箱提供商: {provider}")
+
+    def _build_custom_bundle():
+        client = CustomDomainMailClient()
+        email = client.generate_email()
+        print("[*] 自定义域名邮箱已就绪，将轮询 QQ IMAP 接收验证码")
+
+        def _extract_all_codes() -> List[str]:
+            try:
+                return client.extract_codes_for(email)
+            except Exception:
+                return []
+
+        def fetch_code(timeout_sec: int = 180, poll: float = 6.0, exclude_codes: Optional[List[str]] = None) -> str | None:
+            return client.fetch_code(email, timeout_sec=timeout_sec, poll=poll, exclude_codes=exclude_codes)
+
+        return email, _gen_password(), fetch_code, _extract_all_codes, "custom"
 
     def _build_tempmail_bundle():
         inbox = EMail(proxies)
@@ -207,10 +442,19 @@ def get_email_and_code_fetcher(proxies: Any = None, provider: str = "auto"):
 
         return email, _gen_password(), fetch_code, _extract_all_codes, "gptmail"
 
+    if provider == "custom":
+        return _build_custom_bundle()
     if provider == "tempmail":
         return _build_tempmail_bundle()
     if provider == "gptmail":
         return _build_gptmail_bundle()
+
+    # auto 模式：有 CUSTOM_EMAIL_DOMAIN 配置则优先走自定义域名
+    if CUSTOM_EMAIL_DOMAIN and QQ_IMAP_USER and QQ_IMAP_PASS:
+        try:
+            return _build_custom_bundle()
+        except Exception as e:
+            print(f"[邮箱] 自定义域名邮箱初始化失败，回退公共服务: {e}")
 
     try:
         return _build_tempmail_bundle()
@@ -674,7 +918,10 @@ class MiniPoolMaintainer:
 
     async def probe_and_clean_async(self, workers: int = 20, timeout: int = 10, retries: int = 1):
         if aiohttp is None:
-            raise RuntimeError("需要安装 aiohttp: pip install aiohttp")
+            raise RuntimeError(
+                "当前运行环境缺少 aiohttp。"
+                "如果你是用 uv run 启动，请先在项目目录执行: uv sync --extra cpa"
+            )
         files = self.fetch_auth_files(timeout)
         candidates = [f for f in files if _get_item_type(f).lower() == self.target_type.lower()]
         if not candidates:
@@ -848,7 +1095,7 @@ def _remove_account_entry(accounts_path: Path, email: str, real_pwd: str):
 
 # ========== 主注册流程 (恢复详细日志与异常捕获) ==========
 
-def run(proxy: Optional[str], mail_provider: str = "auto"):
+def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 900, otp_resend_interval: int = 300):
     proxies = {"http": proxy, "https": proxy} if proxy else None
     s = requests.Session(proxies=proxies, impersonate="chrome")
     s.headers.update({
@@ -928,18 +1175,61 @@ def run(proxy: Optional[str], mail_provider: str = "auto"):
 
         print("[步骤5] 触发 OpenAI 发送验证邮件...")
         s.get("https://auth.openai.com/create-account/password", timeout=15)
+        try:
+            email_otp_sentinel = _build_sentinel_payload(s, did, "authorize_continue")
+        except Exception as e:
+            print(f"[警告] 获取发送验证码 Sentinel 失败（将无 token 继续）: {e}")
+            email_otp_sentinel = ""
+        otp_send_headers = {
+            "referer": "https://auth.openai.com/create-account/password",
+            "accept": "application/json",
+        }
+        if email_otp_sentinel:
+            otp_send_headers["openai-sentinel-token"] = email_otp_sentinel
         otp_send_res = s.get(
             "https://auth.openai.com/api/accounts/email-otp/send",
-            headers={"referer": "https://auth.openai.com/create-account/password", "accept": "application/json"},
+            headers=otp_send_headers,
             timeout=15,
         )
-        print(f"[日志] 发送指令状态: {otp_send_res.status_code}")
+        print(f"[日志] 发送指令状态: {otp_send_res.status_code} | body: {otp_send_res.text[:300]}")
         if otp_send_res.status_code != 200:
             print(f"[失败] 发送验证码失败: {otp_send_res.text[:200]}")
             return None
 
-        print("[步骤6] 等待邮箱接收 6 位验证码...")
-        code = code_fetcher()
+        # 跟随 continue_url 访问 email-verification 页面 —— 浏览器会自动跳转此处
+        # 这个 GET 才是真正触发 OpenAI 后台发信的信号，脚本之前少了这步
+        try:
+            otp_continue = str((otp_send_res.json() or {}).get("continue_url") or "").strip()
+        except Exception:
+            otp_continue = ""
+        otp_continue = otp_continue or "https://auth.openai.com/email-verification"
+        print(f"[步骤5b] 跟随跳转触发邮件发送: GET {otp_continue}")
+        s.get(otp_continue, headers={"referer": "https://auth.openai.com/create-account/password"}, timeout=15)
+
+        print(f"[步骤6] 等待邮箱接收 6 位验证码（超时 {email_timeout}s，每 {otp_resend_interval}s 无码自动重发）...")
+        code = None
+        reg_start = time.monotonic()
+        reg_last_send = reg_start
+        while not code and time.monotonic() - reg_start < email_timeout:
+            seg = min(otp_resend_interval, int(email_timeout - (time.monotonic() - reg_start)))
+            if seg <= 0:
+                break
+            code = code_fetcher(timeout_sec=seg)
+            if code:
+                break
+            elapsed_reg = int(time.monotonic() - reg_start)
+            if elapsed_reg < email_timeout:
+                print(f"[步骤6] {seg}s 内未收到验证码（已等 {elapsed_reg}s），重新触发发送...")
+                try:
+                    rr = s.get(
+                        "https://auth.openai.com/api/accounts/email-otp/send",
+                        headers={**otp_send_headers},
+                        timeout=15,
+                    )
+                    print(f"[步骤6] 重发指令状态: {rr.status_code}")
+                    s.get(otp_continue, headers={"referer": "https://auth.openai.com/create-account/password"}, timeout=15)
+                except Exception as _re:
+                    print(f"[步骤6] 重发失败: {_re}")
         if not code:
             print("[失败] 邮箱长时间未收到验证码")
             return None
@@ -1036,19 +1326,39 @@ def run(proxy: Optional[str], mail_provider: str = "auto"):
                     headers={"referer": "https://auth.openai.com/log-in/password"},
                     timeout=15,
                 )
-                print("[*] 正在等待登录 OTP...")
-                time.sleep(2)
+                print(f"[*] 正在等待登录 OTP（超时 {email_timeout}s，每 {otp_resend_interval}s 无码自动重发）...")
+                time.sleep(3)
 
                 otp2 = None
                 baseline_codes = set(existing_codes)
                 baseline_codes.add(first_code)
-                for _ in range(40):
+                otp_start = time.monotonic()
+                otp_last_send = otp_start
+                otp_attempt = 0
+                while time.monotonic() - otp_start < email_timeout:
+                    otp_attempt += 1
                     all_codes = extract_all_codes()
                     new_codes = [c for c in all_codes if c not in baseline_codes]
                     if new_codes:
                         otp2 = new_codes[-1]
                         break
-                    time.sleep(2)
+                    elapsed = int(time.monotonic() - otp_start)
+                    # 超过重发间隔则重新触发 OTP 发送
+                    if time.monotonic() - otp_last_send >= otp_resend_interval:
+                        print(f"[otp-login] {otp_resend_interval}s 未收到 OTP，重新触发发送...")
+                        try:
+                            rr2 = s2.get(
+                                "https://auth.openai.com/api/accounts/email-otp/send",
+                                headers={"referer": "https://auth.openai.com/email-verification", "accept": "application/json"},
+                                timeout=15,
+                            )
+                            print(f"[otp-login] 重发状态: {rr2.status_code}")
+                            s2.get("https://auth.openai.com/email-verification", timeout=15)
+                        except Exception as _re2:
+                            print(f"[otp-login] 重发失败: {_re2}")
+                        otp_last_send = time.monotonic()
+                    print(f"[otp-login] 轮询 #{otp_attempt} ({elapsed}s/{email_timeout}s), 还未收到新 OTP...")
+                    time.sleep(6)
 
                 if not otp2:
                     print("[失败] 未收到登录 OTP")
@@ -1073,8 +1383,13 @@ def run(proxy: Optional[str], mail_provider: str = "auto"):
                 print("[成功] 登录 OTP 验证成功")
 
                 consent_url = str(val2_data.get("continue_url") or "").strip()
+                consent_data = {}
                 if consent_url:
-                    s2.get(consent_url, timeout=15)
+                    consent_resp = s2.get(consent_url, timeout=15)
+                    try:
+                        consent_data = consent_resp.json() or {}
+                    except Exception:
+                        consent_data = {}
 
                 auth_cookie = s2.cookies.get("oai-client-auth-session", domain=".auth.openai.com") or s2.cookies.get("oai-client-auth-session")
                 if not auth_cookie:
@@ -1082,27 +1397,93 @@ def run(proxy: Optional[str], mail_provider: str = "auto"):
                     continue
                 auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
 
-                if "workspaces" not in auth_json or not auth_json["workspaces"]:
-                    print(f"[失败] Cookie 中无 workspaces: {list(auth_json.keys())}")
-                    continue
-                workspace_id = auth_json["workspaces"][0]["id"]
-                print(f"[成功] Workspace ID: {workspace_id}")
+                # ── workspace 获取（三层兜底）──────────────────────────────
+                workspace_id = ""
+                sel_data = {}
 
-                select_resp = s2.post(
-                    "https://auth.openai.com/api/accounts/workspace/select",
-                    headers={
-                        "referer": consent_url,
-                        "accept": "application/json",
-                        "content-type": "application/json",
-                    },
-                    json={"workspace_id": workspace_id},
-                    timeout=15,
-                )
-                print(f"[日志] Workspace 选择状态: {select_resp.status_code}")
-                if select_resp.status_code != 200:
-                    print(f"[失败] Workspace 选择失败: {select_resp.text[:200]}")
+                # 层1：从 cookie 读（老账号正常路径）
+                if auth_json.get("workspaces"):
+                    workspace_id = auth_json["workspaces"][0]["id"]
+                    print(f"[成功] Workspace ID (from cookie): {workspace_id}")
+
+                # 层2：consent_url 响应 JSON 里直接含 workspace 信息
+                if not workspace_id:
+                    ws_from_consent = (
+                        (consent_data.get("page") or {}).get("payload") or {}
+                    ).get("workspace_id") or (consent_data.get("workspace_id") or "")
+                    if ws_from_consent:
+                        workspace_id = str(ws_from_consent).strip()
+                        print(f"[成功] Workspace ID (from consent response): {workspace_id}")
+
+                # 层3：POST workspace/select 不带 ID，让 OpenAI 返回默认 workspace
+                if not workspace_id:
+                    print("[*] Cookie 无 workspaces（新账号），尝试直接调用 workspace/select...")
+                    try:
+                        ws_resp = s2.post(
+                            "https://auth.openai.com/api/accounts/workspace/select",
+                            headers={"referer": consent_url or "https://auth.openai.com/", "accept": "application/json", "content-type": "application/json"},
+                            json={},
+                            timeout=15,
+                        )
+                        print(f"[日志] workspace/select(空) 状态: {ws_resp.status_code} | body: {ws_resp.text[:300]}")
+                        ws_data = ws_resp.json() if ws_resp.status_code == 200 else {}
+                        # 如果直接返回了 continue_url，则跳过 workspace_id 走重定向
+                        if ws_data.get("continue_url"):
+                            sel_data = ws_data
+                            workspace_id = "__skip__"
+                        elif ws_data.get("page", {}).get("type") == "organization_select":
+                            sel_data = ws_data
+                            workspace_id = "__skip__"
+                    except Exception as _we:
+                        print(f"[*] workspace/select(空) 失败: {_we}")
+
+                # 层4：兜底 —— 直接跟踪 consent_url 的重定向链，碰运气找到 localhost callback
+                if not workspace_id:
+                    print("[*] 尝试直接跟踪 consent_url 重定向链获取 OAuth callback...")
+                    try:
+                        r0 = s2.get(consent_url, allow_redirects=False, timeout=15)
+                        for _i in range(20):
+                            loc0 = r0.headers.get("Location", "")
+                            if loc0.startswith("http://localhost"):
+                                cbk = loc0
+                                break
+                            if r0.status_code not in (301, 302, 303) or not loc0:
+                                break
+                            r0 = s2.get(loc0, allow_redirects=False, timeout=15)
+                        else:
+                            cbk = None
+                    except Exception:
+                        cbk = None
+                    if cbk:
+                        token_json = submit_callback_url(
+                            callback_url=cbk, expected_state=oauth2.state,
+                            code_verifier=oauth2.code_verifier, redirect_uri=oauth2.redirect_uri, session=s2,
+                        )
+                        print("[大功告成] 账号注册完毕！(consent 直跳 callback)")
+                        return token_json, email, password
+
+                    print(f"[失败] 无法获取 Workspace ID，Cookie 字段: {list(auth_json.keys())}")
                     continue
-                sel_data = select_resp.json() or {}
+                # ─────────────────────────────────────────────────────────
+
+                # 已有 workspace_id 且还没拿到 sel_data，走正常 workspace/select 流程
+                if workspace_id != "__skip__":
+                    print(f"[成功] Workspace ID: {workspace_id}")
+                    select_resp = s2.post(
+                        "https://auth.openai.com/api/accounts/workspace/select",
+                        headers={
+                            "referer": consent_url,
+                            "accept": "application/json",
+                            "content-type": "application/json",
+                        },
+                        json={"workspace_id": workspace_id},
+                        timeout=15,
+                    )
+                    print(f"[日志] Workspace 选择状态: {select_resp.status_code}")
+                    if select_resp.status_code != 200:
+                        print(f"[失败] Workspace 选择失败: {select_resp.text[:200]}")
+                        continue
+                    sel_data = select_resp.json() or {}
 
                 if sel_data.get("page", {}).get("type", "") == "organization_select":
                     orgs = sel_data.get("page", {}).get("payload", {}).get("data", {}).get("orgs", [])
@@ -1167,11 +1548,13 @@ def run(proxy: Optional[str], mail_provider: str = "auto"):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--proxy", help="代理地址")
-    parser.add_argument("--mail-provider", choices=["auto", "gptmail", "tempmail"], default="auto", help="临时邮箱提供商：auto/gptmail/tempmail")
-    parser.add_argument("--once", action="store_true", help="只运行一次")
-    parser.add_argument("--sleep-min", type=int, default=5, help="最小间隔(秒)")
-    parser.add_argument("--sleep-max", type=int, default=30, help="最大间隔(秒)")
+    parser.add_argument("--proxy", default=DEFAULT_PROXY or None, help="代理地址 [env: HTTP_PROXY / HTTPS_PROXY]")
+    parser.add_argument("--mail-provider", choices=["auto", "gptmail", "tempmail", "custom"], default=DEFAULT_MAIL_PROVIDER, help="邮箱提供商 [env: MAIL_PROVIDER]")
+    parser.add_argument("--email-timeout", type=int, default=DEFAULT_EMAIL_TIMEOUT, help="等待验证码邮件的最大超时（秒）[env: EMAIL_TIMEOUT，默认 900]")  
+    parser.add_argument("--otp-resend-interval", type=int, default=DEFAULT_OTP_RESEND_INTERVAL, help="OTP 等待超过此秒数无响应则重发（秒）[env: OTP_RESEND_INTERVAL，默认 300]")  
+    parser.add_argument("--once", action="store_true", default=_as_bool(os.getenv("RUN_ONCE")), help="只运行一次 [env: RUN_ONCE]")
+    parser.add_argument("--sleep-min", type=int, default=DEFAULT_SLEEP_MIN, help="最小间隔(秒) [env: SLEEP_MIN]")  
+    parser.add_argument("--sleep-max", type=int, default=DEFAULT_SLEEP_MAX, help="最大间隔(秒) [env: SLEEP_MAX]")
 
     parser.add_argument("--sub2api-base-url", default=os.getenv("SUB2API_BASE_URL"), help="Sub2API 基础地址")
     parser.add_argument("--sub2api-admin-api-key", default=os.getenv("SUB2API_ADMIN_API_KEY"), help="Sub2API 管理端全局 API Key（优先使用）")
@@ -1205,7 +1588,12 @@ def main():
 
         if pm:
             if args.cpa_clean:
+                print(
+                    f"[CPA] 开始预清理: workers={max(1, args.cpa_workers)} "
+                    f"timeout={max(5, args.cpa_timeout)} retries={max(0, args.cpa_retries)}"
+                )
                 _clean_invalid_in_cpa(pm, args)
+            print("[CPA] 开始统计当前有效 token...")
             current_count = _count_valid_cpa_tokens(pm, args)
             print(f"[CPA] 当前有效 token: {current_count} / {args.cpa_target_count}")
             if current_count >= args.cpa_target_count:
@@ -1216,7 +1604,7 @@ def main():
                 time.sleep(wait_time)
                 continue
 
-        res = run(args.proxy, args.mail_provider)
+        res = run(args.proxy, args.mail_provider, email_timeout=args.email_timeout, otp_resend_interval=args.otp_resend_interval)
         if res:
             token_json, email, real_pwd = res
             print(f"[🎉] 成功! {email} ---- {real_pwd}")
@@ -1259,6 +1647,7 @@ def main():
 
             # 6. 注册后再清理一次（可选）
             if pm and args.cpa_clean:
+                print("[CPA] 开始注册后清理...")
                 _clean_invalid_in_cpa(pm, args)
         else:
             print("[-] 本次注册流程未能完成。")
