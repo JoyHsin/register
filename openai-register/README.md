@@ -1,114 +1,162 @@
 # OpenAI 自动注册
 
 ## 功能亮点
-- 支持两种临时邮箱：`TempMail.lol` 与 `GPTMail`，可手动指定，也可自动回退。
-- 支持自动上传到 Sub2API，优先使用全局 Admin API Key（`x-api-key`），无需先登录拿 bearer。
-- 支持 CPA 自动上号（上传 token）与失效账号清理（探测 401/用量超阈值后删除）。
-- 支持统一的 `--prune-local`：当 Sub2API / CPA 任一上传成功后，自动删除本地 token 文件和 `tokens/accounts.txt` 里的对应账号行。
 
-## 环境准备
-基础功能（注册 / Sub2API 上传）只需要：
+- **自定义域名邮箱**：通过 Cloudflare 邮件路由 + QQ IMAP 实现私有化收件，无需公共临时邮箱。
+- **OTP 自动重发**：等待超时后自动重新触发验证码发送，应对 OpenAI 发信延迟。
+- **CPA 集成**：自动上传 token、清理失效账号、按目标数量控制循环。
+- **Sub2API 集成**：支持全局 Admin API Key 直接上传。
+- **全环境变量配置**：所有参数均可通过 `.env` 文件配置，无需命令行参数即可启动。
+
+---
+
+## 快速开始
+
+### 1. 安装依赖
 
 ```bash
 cd openai-register
-uv sync
+uv sync              # 基础功能
+uv sync --extra cpa  # 若需要 CPA 清理（依赖 aiohttp）
 ```
 
-如果要启用 **CPA 清理功能**（`--cpa-clean`，依赖 `aiohttp`），再安装可选依赖：
+### 2. 配置环境变量
 
 ```bash
-cd openai-register
-uv sync --extra cpa
+cp .env.example .env
+# 编辑 .env，填入你的实际配置
 ```
 
-## 运行示例
+### 3. 启动
+
 ```bash
-cd openai-register
+uv run python openai_register.py
+```
+
+就这样，无需任何命令行参数。
+
+---
+
+## .env 配置说明
+
+完整配置模板见 [.env.example](.env.example)，下面按模块说明：
+
+### 邮箱配置（必填，使用自定义域名方案时）
+
+```env
+MAIL_PROVIDER="custom"           # 使用自定义域名 + QQ IMAP
+
+# Cloudflare 转发的目标域名，邮箱格式：{随机}{SUFFIX}@DOMAIN
+CUSTOM_EMAIL_DOMAIN="yourdomain.com"
+CUSTOM_EMAIL_SUFFIX="_bot"       # 后缀，留空则纯随机
+CUSTOM_EMAIL_RANDOM_LENGTH="6"   # 随机前缀长度（默认 6）
+
+# QQ 邮箱 IMAP（Cloudflare 转发收件箱）
+QQ_IMAP_USER="yourqq@qq.com"
+QQ_IMAP_PASS="your_qq_auth_code" # 授权码，非 QQ 密码！
+```
+
+> 如何获取 QQ 授权码：QQ 邮箱 → 设置 → 账户 → 开启 IMAP/SMTP → 生成授权码
+
+### CPA 配置
+
+```env
+CPA_BASE_URL="https://your-cpa-host.com"
+CPA_TOKEN="your_cpa_password"    # CPA 后台登录密码
+CPA_UPLOAD="true"                # 注册成功后自动上传
+CPA_CLEAN="true"                 # 自动清理失效账号
+CPA_TARGET_COUNT="100"           # 目标有效 token 数，达到后自动等待
+PRUNE_LOCAL="true"               # 上传成功后删除本地文件
+
+# 以下有合理默认值，一般不用改
+CPA_WORKERS="1"
+CPA_TIMEOUT="12"
+CPA_RETRIES="1"
+CPA_USED_THRESHOLD="95"
+```
+
+### 运行行为
+
+```env
+EMAIL_TIMEOUT="900"          # 等待邮件最长秒数（默认 900 = 15 分钟）
+OTP_RESEND_INTERVAL="300"    # 超过多少秒没收到则自动重发（默认 300 = 5 分钟）
+SLEEP_MIN="20"               # 两次注册最小间隔秒数
+SLEEP_MAX="45"               # 两次注册最大间隔秒数
+```
+
+### 代理（可选）
+
+```env
+HTTP_PROXY="http://127.0.0.1:7890"
+HTTPS_PROXY="http://127.0.0.1:7890"
+```
+
+---
+
+## Cloudflare 邮件路由配置
+
+1. 在 Cloudflare 控制台 → **Email Routing** → 启用
+2. 添加 Catch-all 规则：`*@yourdomain.com` → 转发到 `yourqq@qq.com`
+3. QQ 邮箱开启 IMAP，填入授权码
+
+---
+
+## 命令行参数（可选覆盖）
+
+所有参数都有对应的环境变量默认值。只在需要临时覆盖时使用：
+
+```bash
+# 只跑一次
 uv run python openai_register.py --once
+
+# 调整等待时间
+uv run python openai_register.py --email-timeout 1200 --otp-resend-interval 240
+
+# 临时指定代理
+uv run python openai_register.py --proxy http://127.0.0.1:7890
+
+# 修改 CPA 目标数
+uv run python openai_register.py --cpa-target-count 200
 ```
 
-指定临时邮箱提供商：
+查看所有参数：
+
 ```bash
-uv run python openai_register.py --mail-provider tempmail --once
-uv run python openai_register.py --mail-provider gptmail --once
+uv run python openai_register.py --help
 ```
 
-启用 Sub2API 自动上传示例（推荐用全局 Admin API Key）：
-```bash
-cd openai-register
-uv run python openai_register.py \
-  --sub2api-base-url http://203.0.113.10:8080 \
-  --sub2api-admin-api-key YOUR_SUB2API_ADMIN_API_KEY \
-  --sub2api-group-ids 2 \
-  --sub2api-upload --prune-local \
-  --once
-```
+---
 
-也可直接用环境变量：
-```bash
-export SUB2API_BASE_URL="http://203.0.113.10:8080"
-export SUB2API_ADMIN_API_KEY="YOUR_SUB2API_ADMIN_API_KEY"
-export SUB2API_GROUP_IDS="2"
-export AUTO_UPLOAD_SUB2API="true"
-uv run python openai_register.py --once
-```
+## 常见问题
 
-使用邮箱密码登录获取 bearer token 的认证方式：
-```bash
-uv run python openai_register.py \
-  --sub2api-base-url http://203.0.113.10:8080 \
-  --sub2api-email admin@example.com \
-  --sub2api-password 'your_admin_password' \
-  --sub2api-upload --prune-local \
-  --once
-```
+**Q: 脚本提示 `CUSTOM_EMAIL_DOMAIN 未配置`**  
+A: 检查 `.env` 文件是否存在且 `CUSTOM_EMAIL_DOMAIN` 有值。`.env` 需放在 `openai-register/` 目录下。
 
-启用 CPA 上传 + 清理 + 本地同步示例（如果还要用 `--cpa-clean`，需先 `uv sync --extra cpa`）：
-```bash
-cd openai-register
-uv run python openai_register.py \
-  --cpa-base-url http://203.0.113.10:8317 \
-  --cpa-token YOUR_CPA_LOGIN_PASSWORD \
-  --cpa-upload --cpa-clean --prune-local \
-  --cpa-workers 1 --cpa-timeout 12 --cpa-retries 1 --cpa-used-threshold 95 \
-  --cpa-target-count 300 --sleep-min 5 --sleep-max 30
-```
+**Q: 一直提示 `共匹配 0 个候选码`，收不到验证码**  
+A: 检查 Cloudflare Email Routing 活动日志，确认邮件是否被转发到 QQ 邮箱。若 Cloudflare 已转发但脚本没收到，检查 `QQ_IMAP_PASS` 是否是授权码（非 QQ 密码）。
 
-**CPA 参数填写说明：**
-- `--cpa-token`：这里填的就是 **CPA 后台登录密码**，不是别的 API key。
-- `--cpa-base-url`：只需要填写到 **协议 + IP/域名 + 端口**，不要带后台页面路径。
-- 正确示例：`http://203.0.113.10:8317`
-- 错误示例：`http://203.0.113.10:8317/management.html#/`
-- `--cpa-target-count`：CPA 目标有效 token 数，达到后循环模式会随机休眠并继续检查。
+**Q: `Cookie 中无 workspaces` 错误**  
+A: 新账号首次登录时正常现象，脚本会自动走多层兜底逻辑，通常可以自动恢复。若仍重试失败，可能是 OpenAI 临时限流。
 
-## 参数说明
-- `--proxy`：可选，HTTP/S 代理地址。
-- `--mail-provider`：临时邮箱提供商，可选 `auto` / `gptmail` / `tempmail`，默认 `auto`。
-- `--once`：只跑一轮；不加则循环运行。
-- `--sleep-min` / `--sleep-max`：循环模式下两轮之间的随机等待秒数。
-- `--sub2api-base-url`：Sub2API 地址，只填写到 `协议 + IP/域名 + 端口`。
-- `--sub2api-admin-api-key`：Sub2API 全局管理员 API Key，请求头走 `x-api-key`，这是推荐方式。
-- `--sub2api-bearer`：兼容旧方式的 Bearer token。
-- `--sub2api-email` / `--sub2api-password`：兼容旧方式，401 时可自动登录换 bearer。
-- `--sub2api-group-ids`：上传后绑定的分组 ID，逗号分隔，默认 `2`。
-- `--sub2api-upload`：注册成功后自动上传到 Sub2API；也可用环境变量 `AUTO_UPLOAD_SUB2API=true`。
-- `--prune-local`：当 Sub2API / CPA 任一上传成功后，删除本地 token 文件和 `tokens/accounts.txt` 中对应账号行。
-- `--cpa-base-url`：CPA 管理地址，只填写到 `协议 + IP/域名 + 端口`，不要带 `/management.html#/` 这类后台页面路径。
-- `--cpa-token`：这里填写的就是 CPA 后台登录密码。可直接用参数传入，也可用环境变量 `CPA_TOKEN` 覆盖。
-- `--cpa-workers` / `--cpa-timeout` / `--cpa-retries` / `--cpa-used-threshold`：CPA 清理探测并发、超时、重试、用量判定阈值（默认 95）。
-- `--cpa-upload`：注册成功后把 token 文件上传到 CPA；这一项本身不需要额外依赖。
-- `--cpa-clean`：注册成功后探测并删除 CPA 中失效/用量超阈值的账号（需要可选依赖 `aiohttp`，也就是 `uv sync --extra cpa`）。
-- `--cpa-target-count`：CPA 目标有效 token 数（默认 300）。
+**Q: `CPA_CLEAN` 需要额外依赖**  
+A: 运行 `uv sync --extra cpa` 安装 `aiohttp`。
+
+---
 
 ## 输出位置
-- 账号密码：`tokens/accounts.txt`（格式：`email----password`）。
-- Token JSON：`tokens/token_<email>_<timestamp>.json`。
 
-> 注意：`tokens/` 目录已加入 `.gitignore`，默认不会提交到仓库。
+| 文件 | 说明 |
+|------|------|
+| `tokens/accounts.txt` | 账号密码，格式：`email----password` |
+| `tokens/token_<email>_<timestamp>.json` | 完整 token JSON |
 
-## 注意
-- 需能访问 `https://auth.openai.com`；代理地区尽量避开 CN/HK。
-- 若某个临时邮箱提供商不稳定，可切换 `--mail-provider gptmail` 或 `--mail-provider tempmail` 单独测试。
-- 如果使用 `--mail-provider auto`，会优先尝试 `TempMail.lol`，失败后自动回退到 `GPTMail`。
-auto`，会优先尝试 `TempMail.lol`，失败后自动回退到 `GPTMail`。
- `TempMail.lol`，失败后自动回退到 `GPTMail`。
+> `tokens/` 已加入 `.gitignore`，不会提交到仓库。
+
+---
+
+## 注意事项
+
+- 需能访问 `https://auth.openai.com`，代理地区建议避开 CN / HK。
+- `MAIL_PROVIDER=auto` 时若无自定义域名配置，会回退到公共临时邮箱（稳定性较低）。
+- `CPA_TOKEN` 填写的是 **CPA 后台登录密码**，不是 API Key。
+- `CPA_BASE_URL` 只填到端口，不带后台页面路径：`http://1.2.3.4:8317` ✅，`http://1.2.3.4:8317/management.html#/` ❌

@@ -81,6 +81,17 @@ DEFAULT_SLEEP_MAX = int(os.getenv("SLEEP_MAX") or "30")
 DEFAULT_MAIL_PROVIDER = str(os.getenv("MAIL_PROVIDER") or "auto").strip().lower()
 DEFAULT_PROXY = str(os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 
+# ========== CPA 全局配置 ==========
+DEFAULT_CPA_WORKERS = int(os.getenv("CPA_WORKERS") or "1")
+DEFAULT_CPA_TIMEOUT = int(os.getenv("CPA_TIMEOUT") or "12")
+DEFAULT_CPA_RETRIES = int(os.getenv("CPA_RETRIES") or "1")
+DEFAULT_CPA_USED_THRESHOLD = int(os.getenv("CPA_USED_THRESHOLD") or "95")
+DEFAULT_CPA_TARGET_COUNT = int(os.getenv("CPA_TARGET_COUNT") or "300")
+DEFAULT_CPA_UPLOAD = _as_bool(os.getenv("CPA_UPLOAD"))
+DEFAULT_CPA_CLEAN = _as_bool(os.getenv("CPA_CLEAN"))
+DEFAULT_PRUNE_LOCAL = _as_bool(os.getenv("PRUNE_LOCAL"))
+DEFAULT_SUB2API_UPLOAD = _as_bool(os.getenv("AUTO_UPLOAD_SUB2API"))
+
 # ========== 自定义域名邮箱客户端（Cloudflare → QQ IMAP） ==========
 import imaplib
 import email as _email_lib
@@ -1320,27 +1331,44 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                     print(f"[失败] 登录密码验证失败: {pw.text[:200]}")
                     continue
 
+                # 记录触发登录 OTP 前 IMAP 中已有的所有邮件的验证码（作为排除基线）
                 existing_codes = list(extract_all_codes())
+                baseline_codes = set(existing_codes)
+                baseline_codes.add(first_code)  # 排除注册流程的 OTP
+
+                # 触发登录 OTP 发送 —— 密码验证完成后 OpenAI 会跳转到邮件验证页面
+                otp_send_time = time.time()  # 记录触发时间，用于过滤旧邮件
                 s2.get(
                     "https://auth.openai.com/email-verification",
                     headers={"referer": "https://auth.openai.com/log-in/password"},
                     timeout=15,
                 )
+                # 主动触发 OTP 发送接口
+                try:
+                    _otp_trigger = s2.get(
+                        "https://auth.openai.com/api/accounts/email-otp/send",
+                        headers={"referer": "https://auth.openai.com/email-verification", "accept": "application/json"},
+                        timeout=15,
+                    )
+                    print(f"[otp-login] 触发登录 OTP 发送状态: {_otp_trigger.status_code}")
+                except Exception as _ote:
+                    print(f"[otp-login] 触发 OTP 发送失败（将等待自动发送）: {_ote}")
+
                 print(f"[*] 正在等待登录 OTP（超时 {email_timeout}s，每 {otp_resend_interval}s 无码自动重发）...")
-                time.sleep(3)
+                # 等待几秒让邮件到达 IMAP
+                time.sleep(8)
 
                 otp2 = None
-                baseline_codes = set(existing_codes)
-                baseline_codes.add(first_code)
                 otp_start = time.monotonic()
                 otp_last_send = otp_start
                 otp_attempt = 0
                 while time.monotonic() - otp_start < email_timeout:
                     otp_attempt += 1
                     all_codes = extract_all_codes()
+                    # 只接受基线快照之后出现的、且不在排除集中的新验证码
                     new_codes = [c for c in all_codes if c not in baseline_codes]
                     if new_codes:
-                        otp2 = new_codes[-1]
+                        otp2 = new_codes[0]  # 取最新（extract_all_codes 最新在前）
                         break
                     elapsed = int(time.monotonic() - otp_start)
                     # 超过重发间隔则重新触发 OTP 发送
@@ -1358,7 +1386,7 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                             print(f"[otp-login] 重发失败: {_re2}")
                         otp_last_send = time.monotonic()
                     print(f"[otp-login] 轮询 #{otp_attempt} ({elapsed}s/{email_timeout}s), 还未收到新 OTP...")
-                    time.sleep(6)
+                    time.sleep(8)
 
                 if not otp2:
                     print("[失败] 未收到登录 OTP")
@@ -1440,6 +1468,7 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                 # 层4：兜底 —— 直接跟踪 consent_url 的重定向链，碰运气找到 localhost callback
                 if not workspace_id:
                     print("[*] 尝试直接跟踪 consent_url 重定向链获取 OAuth callback...")
+                    cbk = None  # 预先初始化，避免 NameError
                     try:
                         r0 = s2.get(consent_url, allow_redirects=False, timeout=15)
                         for _i in range(20):
@@ -1450,9 +1479,9 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                             if r0.status_code not in (301, 302, 303) or not loc0:
                                 break
                             r0 = s2.get(loc0, allow_redirects=False, timeout=15)
-                        else:
-                            cbk = None
-                    except Exception:
+                        # for...else: 20次循环用尽仍未找到 callback，cbk 保持 None
+                    except Exception as _cbk_ex:
+                        print(f"[*] 跟踪重定向链异常: {_cbk_ex}")
                         cbk = None
                     if cbk:
                         token_json = submit_callback_url(
@@ -1562,17 +1591,17 @@ def main():
     parser.add_argument("--sub2api-email", default=os.getenv("SUB2API_EMAIL"), help="Sub2API 管理员邮箱（旧登录方式）")
     parser.add_argument("--sub2api-password", default=os.getenv("SUB2API_PASSWORD"), help="Sub2API 管理员密码（旧登录方式）")
     parser.add_argument("--sub2api-group-ids", default=os.getenv("SUB2API_GROUP_IDS", "2"), help="Sub2API 绑定分组，逗号分隔")
-    parser.add_argument("--sub2api-upload", action="store_true", help="注册成功后自动上传到 Sub2API")
-    parser.add_argument("--cpa-base-url", default=os.getenv("CPA_BASE_URL"), help="CPA 基础地址")
-    parser.add_argument("--cpa-token", default=os.getenv("CPA_TOKEN"), help="CPA 管理 token (Bearer)")
-    parser.add_argument("--cpa-workers", type=int, default=20, help="CPA 清理并发")
-    parser.add_argument("--cpa-timeout", type=int, default=12, help="CPA 请求超时")
-    parser.add_argument("--cpa-retries", type=int, default=1, help="CPA 清理重试次数")
-    parser.add_argument("--cpa-used-threshold", type=int, default=95, help="CPA used_percent 阈值")
-    parser.add_argument("--cpa-clean", action="store_true", help="注册后自动清理 CPA 失效账号")
-    parser.add_argument("--cpa-upload", action="store_true", help="注册后自动上传 CPA")
-    parser.add_argument("--cpa-target-count", type=int, default=300, help="目标 token 数(有效)")
-    parser.add_argument("--prune-local", action="store_true", help="上传成功后删除本地 token 文件与账号行（适用于 Sub2API / CPA）")
+    parser.add_argument("--sub2api-upload", action="store_true", default=DEFAULT_SUB2API_UPLOAD, help="注册成功后自动上传到 Sub2API [env: AUTO_UPLOAD_SUB2API]")
+    parser.add_argument("--cpa-base-url", default=os.getenv("CPA_BASE_URL"), help="CPA 基础地址 [env: CPA_BASE_URL]")
+    parser.add_argument("--cpa-token", default=os.getenv("CPA_TOKEN"), help="CPA 管理 token [env: CPA_TOKEN]")
+    parser.add_argument("--cpa-workers", type=int, default=DEFAULT_CPA_WORKERS, help="CPA 清理并发 [env: CPA_WORKERS，默认 1]")
+    parser.add_argument("--cpa-timeout", type=int, default=DEFAULT_CPA_TIMEOUT, help="CPA 请求超时 [env: CPA_TIMEOUT，默认 12]")
+    parser.add_argument("--cpa-retries", type=int, default=DEFAULT_CPA_RETRIES, help="CPA 清理重试次数 [env: CPA_RETRIES，默认 1]")
+    parser.add_argument("--cpa-used-threshold", type=int, default=DEFAULT_CPA_USED_THRESHOLD, help="CPA used_percent 阈值 [env: CPA_USED_THRESHOLD，默认 95]")
+    parser.add_argument("--cpa-clean", action="store_true", default=DEFAULT_CPA_CLEAN, help="注册后自动清理 CPA 失效账号 [env: CPA_CLEAN]")
+    parser.add_argument("--cpa-upload", action="store_true", default=DEFAULT_CPA_UPLOAD, help="注册后自动上传 CPA [env: CPA_UPLOAD]")
+    parser.add_argument("--cpa-target-count", type=int, default=DEFAULT_CPA_TARGET_COUNT, help="目标 token 数(有效) [env: CPA_TARGET_COUNT，默认 300]")
+    parser.add_argument("--prune-local", action="store_true", default=DEFAULT_PRUNE_LOCAL, help="上传成功后删除本地 token 文件与账号行 [env: PRUNE_LOCAL]")
     args = parser.parse_args()
 
     tokens_dir = OUT_DIR / "tokens"
