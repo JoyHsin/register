@@ -1711,6 +1711,50 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                         consent_data = {}
                         print("[日志] consent_url 不是 JSON 响应")
 
+                consent_page_type = str((val2_data.get("page") or {}).get("type") or "")
+                needs_about_you = (
+                    consent_page_type == "about_you"
+                    or "/about-you" in consent_url
+                )
+                if needs_about_you:
+                    print("[*] 登录后仍落在 about-you，尝试在当前登录会话补完账户信息...")
+                    try:
+                        login_create_account_sentinel = _build_sentinel_payload(s2, did2, "authorize_continue")
+                        login_acc_res = s2.post(
+                            "https://auth.openai.com/api/accounts/create_account",
+                            headers={
+                                "referer": "https://auth.openai.com/about-you",
+                                "accept": "application/json",
+                                "content-type": "application/json",
+                                "openai-sentinel-token": login_create_account_sentinel,
+                            },
+                            data=json.dumps({"name": _random_name(), "birthdate": _random_birthdate()}),
+                            timeout=15,
+                        )
+                        print(f"[日志] 登录补完 about-you 状态: {login_acc_res.status_code} | body: {login_acc_res.text[:500]}")
+                        if login_acc_res.status_code == 200:
+                            try:
+                                login_acc_data = login_acc_res.json() or {}
+                            except Exception:
+                                login_acc_data = {}
+                            if login_acc_data:
+                                print(f"[日志] 登录补完 about-you JSON keys: {list(login_acc_data.keys())}")
+                            next_url = str(login_acc_data.get("continue_url") or "").strip()
+                            if next_url:
+                                consent_url = next_url
+                                print(f"[日志] about-you 后新的 continue_url: {consent_url}")
+                                consent_resp = s2.get(consent_url, timeout=15)
+                                print(f"[日志] 新 consent_url 状态: {consent_resp.status_code} | url: {consent_url[:200]}")
+                                print(f"[日志] 新 consent_url 响应摘要: {consent_resp.text[:500]}")
+                                try:
+                                    consent_data = consent_resp.json() or {}
+                                    print(f"[日志] 新 consent_url JSON keys: {list(consent_data.keys())}")
+                                except Exception:
+                                    consent_data = {}
+                                    print("[日志] 新 consent_url 不是 JSON 响应")
+                    except Exception as _about_you_ex:
+                        print(f"[日志] 登录补完 about-you 异常: {_about_you_ex}")
+
                 auth_cookie = s2.cookies.get("oai-client-auth-session", domain=".auth.openai.com") or s2.cookies.get("oai-client-auth-session")
                 if not auth_cookie:
                     print("[失败] 登录后未能获取 oai-client-auth-session")
