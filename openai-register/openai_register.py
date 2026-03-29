@@ -50,6 +50,24 @@ def _load_dotenv(env_path: Path):
                 os.environ[key] = val
 
 _load_dotenv(OUT_DIR / ".env")
+
+
+# ========== 提前定义工具函数（模块级常量初始化时需要用到）==========
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _to_int(v) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 AUTH_URL = "https://auth.openai.com/oauth/authorize"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -584,21 +602,6 @@ def _post_form(url: str, data: Dict[str, str], timeout: int = 30) -> Dict[str, A
         raw = exc.read()
         raise RuntimeError(f"Token 交换失败: {exc.code}: {raw.decode('utf-8', 'replace')}") from exc
 
-
-
-def _to_int(v: Any) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _parse_int_csv(raw: str, default: List[int] | None = None) -> List[int]:
