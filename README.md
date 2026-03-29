@@ -1,5 +1,9 @@
 # register
 
+> This repository is a personal fork/mirror of [MasterAlanLab/register](https://github.com/MasterAlanLab/register).
+>
+> Original repository: https://github.com/MasterAlanLab/register
+
 一些注册相关脚本的整理与汇总。
 
 ### 📢 关注我的频道
