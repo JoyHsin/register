@@ -114,6 +114,7 @@ DEFAULT_SUB2API_UPLOAD = _as_bool(os.getenv("AUTO_UPLOAD_SUB2API"))
 import imaplib
 import email as _email_lib
 from email.header import decode_header as _decode_header
+from email.utils import parsedate_to_datetime
 
 
 def _decode_mime_str(raw) -> str:
@@ -130,6 +131,133 @@ def _decode_mime_str(raw) -> str:
         else:
             parts.append(str(byt))
     return " ".join(parts)
+
+
+_OTP_PATTERNS = [
+    r"your\s+chatgpt\s+code\s+is\s*(\d{6})",
+    r"你的\s*chatgpt\s*代码为\s*(\d{6})",
+    r"enter\s+this\s+temporary\s+verification\s+code\s+to\s+continue[:：]?\s*(\d{6})",
+    r"输入此临时验证码以继续[:：]?\s*(\d{6})",
+    r"verification\s+code(?:\s+to\s+continue)?[:：]?\s*(\d{6})",
+    r"验证码(?:为|是)?[:：]?\s*(\d{6})",
+]
+
+OTP_TIME_SKEW_SEC = 120.0
+
+
+@dataclass(frozen=True)
+class OtpCandidate:
+    code: str
+    received_ts: Optional[float]
+    source: str = ""
+
+
+def _unique_codes_in_order(values: List[str]) -> List[str]:
+    ordered: List[str] = []
+    for value in values:
+        if value and value not in ordered:
+            ordered.append(value)
+    return ordered
+
+
+def _extract_ranked_otp_codes(subject: str = "", body: str = "") -> List[str]:
+    """优先提取当前 OpenAI 邮件里的有效 OTP，再附带兜底候选。"""
+    subject = str(subject or "")
+    body = str(body or "")
+    combined = f"{subject}\n{body}".strip()
+    subject_ranked: List[str] = []
+    ranked: List[str] = []
+
+    def _collect_pattern_hits(text: str, bucket: List[str]) -> None:
+        if not text:
+            return
+        for pattern in _OTP_PATTERNS:
+            for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                bucket.append(match)
+
+    # 主题通常最干净，优先级最高；正文只取前半段，尽量避开引用的历史邮件内容。
+    _collect_pattern_hits(subject, subject_ranked)
+    subject_ranked.extend(re.findall(r"(?<!\d)(\d{6})(?!\d)", subject))
+    subject_ranked = _unique_codes_in_order(subject_ranked)
+    if subject_ranked:
+        return subject_ranked
+
+    _collect_pattern_hits(body[:1200], ranked)
+    _collect_pattern_hits(combined[:1200], ranked)
+
+    fallback_pool = []
+    fallback_pool.extend(re.findall(r"(?<!\d)(\d{6})(?!\d)", body[:400]))
+    fallback_pool.extend(re.findall(r"(?<!\d)(\d{6})(?!\d)", body))
+    ranked.extend(fallback_pool)
+    return _unique_codes_in_order(ranked)
+
+
+def _parse_timestamp_value(raw: Any) -> Optional[float]:
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        ts = float(raw)
+        return ts / 1000.0 if ts > 10_000_000_000 else ts
+    if isinstance(raw, datetime):
+        return raw.timestamp()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        ts = float(text)
+        return ts / 1000.0 if ts > 10_000_000_000 else ts
+
+    try:
+        dt = parsedate_to_datetime(text)
+        if dt:
+            return dt.timestamp()
+    except Exception:
+        pass
+
+    normalized = text.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized).timestamp()
+    except Exception:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).timestamp()
+        except Exception:
+            pass
+    return None
+
+
+def _parse_provider_message_timestamp(data: Dict[str, Any]) -> Optional[float]:
+    preferred_keys = [
+        "received_at", "receivedAt", "delivered_at", "deliveredAt",
+        "created_at", "createdAt", "date", "sent_at", "sentAt",
+        "timestamp", "time", "created", "updated_at", "updatedAt",
+    ]
+    for key in preferred_keys:
+        if key in data:
+            ts = _parse_timestamp_value(data.get(key))
+            if ts is not None:
+                return ts
+    for key, value in data.items():
+        key_lower = str(key).lower()
+        if "date" in key_lower or "time" in key_lower:
+            ts = _parse_timestamp_value(value)
+            if ts is not None:
+                return ts
+    return None
+
+
+def _sort_otp_candidates(candidates: List[OtpCandidate]) -> List[OtpCandidate]:
+    return sorted(
+        candidates,
+        key=lambda item: (item.received_ts if item.received_ts is not None else float("-inf")),
+        reverse=True,
+    )
 
 
 class CustomDomainMailClient:
@@ -170,43 +298,67 @@ class CustomDomainMailClient:
         print(f"[+] 自定义邮箱: {addr}  (随机={rand_part}, 后缀={suffix_label})")
         return addr
 
-    def _fetch_folder_msgs(self, conn: imaplib.IMAP4_SSL, folder: str, n: int) -> List[_email_lib.message.Message]:
-        """从指定文件夹取最新 n 封邮件"""
-        msgs: List[_email_lib.message.Message] = []
+    @staticmethod
+    def _parse_internaldate(fetch_parts: Any) -> Optional[float]:
+        if not fetch_parts:
+            return None
+        if not isinstance(fetch_parts, (list, tuple)):
+            fetch_parts = [fetch_parts]
+
+        for item in fetch_parts:
+            candidates = item if isinstance(item, tuple) else (item,)
+            for candidate in candidates:
+                meta_text = candidate.decode("utf-8", errors="replace") if isinstance(candidate, bytes) else str(candidate)
+                match = re.search(r'INTERNALDATE "([^"]+)"', meta_text)
+                if not match:
+                    continue
+                try:
+                    return datetime.strptime(match.group(1), "%d-%b-%Y %H:%M:%S %z").timestamp()
+                except Exception:
+                    continue
+        return None
+
+    def _fetch_folder_msg_entries(self, conn: imaplib.IMAP4_SSL, folder: str, n: int) -> List[tuple[_email_lib.message.Message, Optional[float]]]:
+        """从指定文件夹取最新 n 封邮件及其接收时间"""
+        entries: List[tuple[_email_lib.message.Message, Optional[float]]] = []
         try:
             status, _ = conn.select(folder, readonly=True)
             if status != "OK":
-                return msgs
+                return entries
             _, data = conn.search(None, "ALL")
             all_ids = (data[0] or b"").split()
             target_ids = list(reversed(all_ids[-n:]))  # 最新在前
             for uid in target_ids:
-                _, msg_data = conn.fetch(uid, "(RFC822)")
+                _, msg_data = conn.fetch(uid, "(RFC822 INTERNALDATE)")
+                received_ts = self._parse_internaldate(msg_data)
                 for part in msg_data:
                     if isinstance(part, tuple):
                         msg = _email_lib.message_from_bytes(part[1])
-                        msgs.append(msg)
+                        entries.append((msg, received_ts))
         except Exception as e:
-            print(f"[custom-imap] 文件夹 {folder!r} 读取失败: {e}")
-        return msgs
+            err_msg = str(e)
+            if "codec can't encode" not in err_msg and "EXAMINE command error" not in err_msg and "NONEXISTENT" not in err_msg:
+                print(f"[custom-imap] 文件夹 {folder!r} 读取失败: {e}")
+        return entries
 
-    def _fetch_latest_msgs(self, n: int = 30) -> List[_email_lib.message.Message]:
-        """同时取 INBOX 和垃圾邮件文件夹最新 n 封（最新在前）"""
-        msgs: List[_email_lib.message.Message] = []
-        # QQ 邮箱垃圾箱候选文件夹名
+    def _fetch_folder_msgs(self, conn: imaplib.IMAP4_SSL, folder: str, n: int) -> List[_email_lib.message.Message]:
+        """从指定文件夹取最新 n 封邮件"""
+        return [msg for msg, _ in self._fetch_folder_msg_entries(conn, folder, n)]
+
+    def _fetch_latest_msg_entries(self, n: int = 30) -> List[tuple[_email_lib.message.Message, Optional[float]]]:
+        """同时取 INBOX 和垃圾邮件文件夹最新 n 封（最新在前），并保留接收时间"""
+        entries: List[tuple[_email_lib.message.Message, Optional[float]]] = []
         spam_folders = ["Junk", "垃圾邮件", "Spam", "SPAM", "Bulk Mail"]
         try:
             conn = imaplib.IMAP4_SSL(self.imap_host, self.imap_port)
             conn.login(self.imap_user, self.imap_pass)
             try:
-                # 主收件箱
-                msgs.extend(self._fetch_folder_msgs(conn, self.imap_folder, n))
-                # 垃圾邮件文件夹（逐个尝试）
+                entries.extend(self._fetch_folder_msg_entries(conn, self.imap_folder, n))
                 for folder in spam_folders:
-                    extra = self._fetch_folder_msgs(conn, folder, n)
+                    extra = self._fetch_folder_msg_entries(conn, folder, n)
                     if extra:
                         print(f"[custom-imap] 垃圾箱 {folder!r} 中额外找到 {len(extra)} 封邮件")
-                        msgs.extend(extra)
+                        entries.extend(extra)
                         break
             finally:
                 try:
@@ -215,7 +367,11 @@ class CustomDomainMailClient:
                     pass
         except Exception as e:
             print(f"[custom-imap] IMAP 连接/读取失败: {e}")
-        return msgs
+        return entries
+
+    def _fetch_latest_msgs(self, n: int = 30) -> List[_email_lib.message.Message]:
+        """同时取 INBOX 和垃圾邮件文件夹最新 n 封（最新在前）"""
+        return [msg for msg, _ in self._fetch_latest_msg_entries(n)]
 
     @staticmethod
     def _get_body(msg: _email_lib.message.Message) -> str:
@@ -239,33 +395,38 @@ class CustomDomainMailClient:
     def _msg_targets_email(self, msg: _email_lib.message.Message, target_email: str) -> bool:
         """检查邮件是否发给 target_email（To / Delivered-To / X-Forwarded-To / Envelope-To 等头）"""
         target_lower = target_email.lower()
-        check_headers = ["To", "Delivered-To", "X-Forwarded-To", "Envelope-To", "X-Original-To", "Cc"]
+        check_headers = ["To", "Delivered-To", "X-Forwarded-To", "Envelope-To", "X-Original-To", "Cc", "Resent-To", "Apparently-To"]
         for h in check_headers:
             val = _decode_mime_str(msg.get(h, "")).lower()
             if target_lower in val:
                 return True
-        # 保底：正文中出现目标邮址也算（应对转发头被完全改写的情况）
-        body = self._get_body(msg).lower()
-        if target_lower in body:
-            return True
         return False
 
-    def extract_codes_for(self, target_email: str, n: int = 30) -> List[str]:
-        """取最新 n 封邮件，返回发给 target_email 的所有 6 位验证码列表"""
-        codes: List[str] = []
-        msgs = self._fetch_latest_msgs(n)
-        for msg in msgs:
+    def extract_candidates_for(self, target_email: str, n: int = 30, min_received_ts: Optional[float] = None) -> List[OtpCandidate]:
+        """取最新 n 封邮件，返回发给 target_email 的验证码候选及接收时间"""
+        candidates: List[OtpCandidate] = []
+        entries = self._fetch_latest_msg_entries(n)
+        for msg, received_ts in entries:
             fr = _decode_mime_str(msg.get("From", ""))
             subj = _decode_mime_str(msg.get("Subject", ""))
             if not self._msg_targets_email(msg, target_email):
                 continue
+            received_ts = received_ts or _parse_timestamp_value(_decode_mime_str(msg.get("Date", "")))
+            min_allowed_ts = (min_received_ts - OTP_TIME_SKEW_SEC) if min_received_ts is not None else None
+            if min_allowed_ts is not None and (received_ts is None or received_ts < min_allowed_ts):
+                continue
             body = self._get_body(msg)
-            text = f"{subj} {body}"
-            found = re.findall(r"(?<!\d)(\d{6})(?!\d)", text)
+            found = _extract_ranked_otp_codes(subj, body)
             if found:
-                print(f"[custom-imap] ✅ 命中: From={fr[:50]} Subject={subj[:60]} codes={found}")
-            codes.extend(found)
-        return codes
+                ts_label = datetime.fromtimestamp(received_ts).strftime("%Y-%m-%d %H:%M:%S") if received_ts else "unknown"
+                print(f"[custom-imap] ✅ 命中: From={fr[:50]} Subject={subj[:60]} ts={ts_label} codes={found}")
+            for code in found:
+                candidates.append(OtpCandidate(code=code, received_ts=received_ts, source="custom-imap"))
+        return _sort_otp_candidates(candidates)
+
+    def extract_codes_for(self, target_email: str, n: int = 30, min_received_ts: Optional[float] = None) -> List[str]:
+        """取最新 n 封邮件，返回发给 target_email 的所有 6 位验证码列表"""
+        return [item.code for item in self.extract_candidates_for(target_email, n=n, min_received_ts=min_received_ts)]
 
     def fetch_code(
         self,
@@ -273,19 +434,58 @@ class CustomDomainMailClient:
         timeout_sec: int = 180,
         poll: float = 6.0,
         exclude_codes: Optional[List[str]] = None,
+        min_received_ts: Optional[float] = None,
     ) -> Optional[str]:
         exclude = set(exclude_codes or [])
         start = time.monotonic()
         attempt = 0
         while time.monotonic() - start < timeout_sec:
             attempt += 1
-            codes = self.extract_codes_for(target_email)
+            codes = self.extract_codes_for(target_email, min_received_ts=min_received_ts)
             print(f"[otp][custom] 轮询 #{attempt}, 共匹配 {len(codes)} 个候选码, 收件目标: {target_email}")
             for code in codes:
                 if code not in exclude:
                     return code
             time.sleep(poll)
         return None
+
+    def cleanup_email(self, target_email: str) -> None:
+        """从最新的 30 封邮件中找出该目标的邮件并删除，防止影响后续流程"""
+        spam_folders = ["Junk", "垃圾邮件", "Spam", "SPAM", "Bulk Mail"]
+        try:
+            conn = imaplib.IMAP4_SSL(self.imap_host, self.imap_port)
+            conn.login(self.imap_user, self.imap_pass)
+            
+            def _delete_in(folder):
+                try:
+                    status, _ = conn.select(folder)
+                    if status != "OK":
+                        return
+                    _, data = conn.search(None, "ALL")
+                    all_ids = (data[0] or b"").split()
+                    target_ids = list(reversed(all_ids[-30:]))
+                    for uid in target_ids:
+                        _, msg_data = conn.fetch(uid, "(RFC822)")
+                        for part in msg_data:
+                            if isinstance(part, tuple):
+                                msg = _email_lib.message_from_bytes(part[1])
+                                if self._msg_targets_email(msg, target_email):
+                                    conn.store(uid, "+FLAGS", "\\Deleted")
+                    conn.expunge()
+                except Exception:
+                    pass
+            
+            _delete_in(self.imap_folder)
+            for f in spam_folders:
+                _delete_in(f)
+                
+            try:
+                conn.logout()
+            except Exception:
+                pass
+            print(f"[*] 已清理 {target_email} 相关的验证码收件箱")
+        except Exception as e:
+            print(f"[custom-imap] 清理邮件失败: {e}")
 
 
 # ========== 临时邮箱提供商：GPTMail + TempMail.lol ==========
@@ -379,10 +579,21 @@ def get_email_and_code_fetcher(proxies: Any = None, provider: str = "auto"):
             except Exception:
                 return []
 
-        def fetch_code(timeout_sec: int = 180, poll: float = 6.0, exclude_codes: Optional[List[str]] = None) -> str | None:
-            return client.fetch_code(email, timeout_sec=timeout_sec, poll=poll, exclude_codes=exclude_codes)
+        def _extract_code_candidates(min_received_ts: Optional[float] = None) -> List[OtpCandidate]:
+            try:
+                return client.extract_candidates_for(email, min_received_ts=min_received_ts)
+            except Exception:
+                return []
 
-        return email, _gen_password(), fetch_code, _extract_all_codes, "custom"
+        def fetch_code(
+            timeout_sec: int = 180,
+            poll: float = 6.0,
+            exclude_codes: Optional[List[str]] = None,
+            min_received_ts: Optional[float] = None,
+        ) -> str | None:
+            return client.fetch_code(email, timeout_sec=timeout_sec, poll=poll, exclude_codes=exclude_codes, min_received_ts=min_received_ts)
+
+        return email, _gen_password(), fetch_code, _extract_all_codes, _extract_code_candidates, "custom", client
 
     def _build_tempmail_bundle():
         inbox = EMail(proxies)
@@ -394,82 +605,119 @@ def get_email_and_code_fetcher(proxies: Any = None, provider: str = "auto"):
                 msgs = inbox._get_messages()
                 for msg_data in msgs:
                     msg = Message(msg_data)
-                    body = msg.body or msg.html_body or msg.subject or ""
-                    results.extend(re.findall(r"\b(\d{6})\b", body))
+                    body = msg.body or msg.html_body or ""
+                    results.extend(_extract_ranked_otp_codes(msg.subject, body))
             except Exception:
                 pass
-            return results
+            return _sort_otp_candidates(results)
 
-        def fetch_code(timeout_sec: int = 180, poll: float = 6.0, exclude_codes: Optional[List[str]] = None) -> str | None:
+        def _extract_code_candidates(min_received_ts: Optional[float] = None) -> List[OtpCandidate]:
+            results: List[OtpCandidate] = []
+            try:
+                msgs = inbox._get_messages()
+                for msg_data in msgs:
+                    received_ts = _parse_provider_message_timestamp(msg_data)
+                    min_allowed_ts = (min_received_ts - OTP_TIME_SKEW_SEC) if min_received_ts is not None else None
+                    if min_allowed_ts is not None and (received_ts is None or received_ts < min_allowed_ts):
+                        continue
+                    msg = Message(msg_data)
+                    body = msg.body or msg.html_body or ""
+                    for code in _extract_ranked_otp_codes(msg.subject, body):
+                        results.append(OtpCandidate(code=code, received_ts=received_ts, source="tempmail"))
+            except Exception:
+                pass
+            return _sort_otp_candidates(results)
+
+        def fetch_code(
+            timeout_sec: int = 180,
+            poll: float = 6.0,
+            exclude_codes: Optional[List[str]] = None,
+            min_received_ts: Optional[float] = None,
+        ) -> str | None:
             exclude = set(exclude_codes or [])
             start = time.monotonic()
             attempt = 0
             while time.monotonic() - start < timeout_sec:
                 attempt += 1
                 try:
-                    msgs = inbox._get_messages()
-                    print(f"[otp][tempmail] 轮询 #{attempt}, 收到 {len(msgs)} 封邮件, 目标: {email}")
-                    for msg_data in msgs:
-                        msg = Message(msg_data)
-                        body = msg.body or msg.html_body or msg.subject or ""
-                        for code in re.findall(r"\b(\d{6})\b", body):
-                            if code not in exclude:
-                                return code
+                    candidates = _extract_code_candidates(min_received_ts=min_received_ts)
+                    print(f"[otp][tempmail] 轮询 #{attempt}, 共匹配 {len(candidates)} 个候选码, 目标: {email}")
+                    for candidate in candidates:
+                        if candidate.code not in exclude:
+                            return candidate.code
                 except Exception:
                     pass
                 time.sleep(poll)
             return None
 
-        return email, _gen_password(), fetch_code, _extract_all_codes, "tempmail"
+        return email, _gen_password(), fetch_code, _extract_all_codes, _extract_code_candidates, "tempmail", inbox
 
     def _build_gptmail_bundle():
         client = GPTMailClient(proxies)
         email = client.generate_email()
 
         def _extract_all_codes() -> List[str]:
-            regex = r"(?<!\d)(\d{6})(?!\d)"
             results: List[str] = []
             try:
                 summaries = client.list_emails(email)
                 for s in summaries:
+                    subject = str(s.get("subject", "") or "")
                     body = " ".join([
-                        str(s.get("subject", "") or ""),
                         str(s.get("text", "") or ""),
                         str(s.get("body", "") or ""),
                         str(s.get("html", "") or ""),
                         json.dumps(s, ensure_ascii=False),
                     ])
-                    results.extend(re.findall(regex, body))
+                    results.extend(_extract_ranked_otp_codes(subject, body))
             except Exception:
                 pass
             return results
 
-        def fetch_code(timeout_sec: int = 180, poll: float = 6.0, exclude_codes: Optional[List[str]] = None) -> str | None:
+        def _extract_code_candidates(min_received_ts: Optional[float] = None) -> List[OtpCandidate]:
+            results: List[OtpCandidate] = []
+            try:
+                summaries = client.list_emails(email)
+                for s in summaries:
+                    received_ts = _parse_provider_message_timestamp(s)
+                    min_allowed_ts = (min_received_ts - OTP_TIME_SKEW_SEC) if min_received_ts is not None else None
+                    if min_allowed_ts is not None and (received_ts is None or received_ts < min_allowed_ts):
+                        continue
+                    subject = str(s.get("subject", "") or "")
+                    body = " ".join([
+                        str(s.get("text", "") or ""),
+                        str(s.get("body", "") or ""),
+                        str(s.get("html", "") or ""),
+                        json.dumps(s, ensure_ascii=False),
+                    ])
+                    for code in _extract_ranked_otp_codes(subject, body):
+                        results.append(OtpCandidate(code=code, received_ts=received_ts, source="gptmail"))
+            except Exception:
+                pass
+            return results
+
+        def fetch_code(
+            timeout_sec: int = 180,
+            poll: float = 6.0,
+            exclude_codes: Optional[List[str]] = None,
+            min_received_ts: Optional[float] = None,
+        ) -> str | None:
             exclude = set(exclude_codes or [])
             start = time.monotonic()
             attempt = 0
             while time.monotonic() - start < timeout_sec:
                 attempt += 1
                 try:
-                    summaries = client.list_emails(email)
-                    print(f"[otp][gptmail] 轮询 #{attempt}, 收到 {len(summaries)} 封邮件, 目标: {email}")
-                    for s in summaries:
-                        body = " ".join([
-                            str(s.get("subject", "") or ""),
-                            str(s.get("text", "") or ""),
-                            str(s.get("body", "") or ""),
-                            str(s.get("html", "") or ""),
-                            json.dumps(s, ensure_ascii=False),
-                        ])
-                        for code in re.findall(r"(?<!\d)(\d{6})(?!\d)", body):
-                            if code not in exclude:
-                                return code
+                    candidates = _extract_code_candidates(min_received_ts=min_received_ts)
+                    print(f"[otp][gptmail] 轮询 #{attempt}, 共匹配 {len(candidates)} 个候选码, 目标: {email}")
+                    for candidate in candidates:
+                        if candidate.code not in exclude:
+                            return candidate.code
                 except Exception:
                     pass
                 time.sleep(poll)
             return None
 
-        return email, _gen_password(), fetch_code, _extract_all_codes, "gptmail"
+        return email, _gen_password(), fetch_code, _extract_all_codes, _extract_code_candidates, "gptmail", client
 
     if provider == "custom":
         return _build_custom_bundle()
@@ -1120,7 +1368,7 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
     print(f"\n{'='*20} 开启注册流程 {'='*20}")
     try:
         print(f"[步骤1] 正在初始化临时邮箱（provider={mail_provider}）...")
-        email, password, code_fetcher, extract_all_codes, actual_mail_provider = get_email_and_code_fetcher(proxies, provider=mail_provider)
+        email, password, code_fetcher, extract_all_codes, extract_code_candidates, actual_mail_provider, email_client = get_email_and_code_fetcher(proxies, provider=mail_provider)
         print(f"[*] 当前邮箱提供商: {actual_mail_provider}")
         if not email:
             print("[失败] 未能获取邮箱")
@@ -1222,19 +1470,21 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
 
         print(f"[步骤6] 等待邮箱接收 6 位验证码（超时 {email_timeout}s，每 {otp_resend_interval}s 无码自动重发）...")
         code = None
+        reg_otp_send_time = time.time()
         reg_start = time.monotonic()
         reg_last_send = reg_start
         while not code and time.monotonic() - reg_start < email_timeout:
             seg = min(otp_resend_interval, int(email_timeout - (time.monotonic() - reg_start)))
             if seg <= 0:
                 break
-            code = code_fetcher(timeout_sec=seg)
+            code = code_fetcher(timeout_sec=seg, min_received_ts=reg_otp_send_time)
             if code:
                 break
             elapsed_reg = int(time.monotonic() - reg_start)
             if elapsed_reg < email_timeout:
                 print(f"[步骤6] {seg}s 内未收到验证码（已等 {elapsed_reg}s），重新触发发送...")
                 try:
+                    reg_otp_send_time = time.time()
                     rr = s.get(
                         "https://auth.openai.com/api/accounts/email-otp/send",
                         headers={**otp_send_headers},
@@ -1262,8 +1512,11 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
         )
         print(f"[日志] 验证码校验状态: {val_res.status_code}")
         if val_res.status_code != 200:
-            print(f"[失败] 验证码校验失败: {val_res.text[:200]}")
+            print(f"[失败] OTP 校验不通过: {val_res.text[:200]}")
             return None
+        print("[成功] 注册 OTP 校验完成")
+        if hasattr(email_client, "cleanup_email"):
+            email_client.cleanup_email(email)
 
         print("[步骤8] 完善账户基本信息...")
         try:
@@ -1365,19 +1618,68 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                 otp_start = time.monotonic()
                 otp_last_send = otp_start
                 otp_attempt = 0
+                val2_data = {}
+                
                 while time.monotonic() - otp_start < email_timeout:
                     otp_attempt += 1
-                    all_codes = extract_all_codes()
-                    # 只接受基线快照之后出现的、且不在排除集中的新验证码
-                    new_codes = [c for c in all_codes if c not in baseline_codes]
-                    if new_codes:
-                        otp2 = new_codes[0]  # 取最新（extract_all_codes 最新在前）
+                    all_candidates = _sort_otp_candidates(extract_code_candidates(min_received_ts=otp_send_time))
+                    # 只接受基线快照之后出现的候选，并按收到时间从新到旧去重
+                    new_candidates: List[OtpCandidate] = []
+                    seen_codes = set()
+                    for candidate in all_candidates:
+                        if candidate.code in baseline_codes or candidate.code in seen_codes:
+                            continue
+                        seen_codes.add(candidate.code)
+                        new_candidates.append(candidate)
+                    if new_candidates:
+                        order_text = ", ".join(
+                            f"{item.code}@{datetime.fromtimestamp(item.received_ts).strftime('%H:%M:%S') if item.received_ts else 'unknown'}"
+                            for item in new_candidates[:5]
+                        )
+                        print(f"[otp-login] 候选顺序(新->旧): {order_text}")
+                    
+                    session_locked = False
+                    for candidate in new_candidates:
+                        candidate_code = candidate.code
+                        print(f"[*] 发现候选登录 OTP {candidate_code}，正在尝试校验...")
+                        val2 = s2.post(
+                            "https://auth.openai.com/api/accounts/email-otp/validate",
+                            headers={
+                                "referer": "https://auth.openai.com/email-verification",
+                                "accept": "application/json",
+                                "content-type": "application/json",
+                            },
+                            json={"code": candidate_code},
+                            timeout=15,
+                        )
+                        print(f"[日志] 登录 OTP 校验状态: {val2.status_code}")
+                        if val2.status_code == 200:
+                            print(f"[成功] 登录 OTP {candidate_code} 验证成功")
+                            otp2 = candidate_code
+                            val2_data = val2.json() or {}
+                            if hasattr(email_client, "cleanup_email"):
+                                email_client.cleanup_email(email)
+                            break
+                        else:
+                            err_code = (val2.json() or {}).get("error", {}).get("code", "")
+                            if err_code == "max_check_attempts":
+                                print(f"[警告] 校验次数超限(max_check_attempts)，OTP会话已锁定，放弃本轮等待！")
+                                baseline_codes.add(candidate_code)
+                                session_locked = True
+                                break
+                            else:
+                                print(f"[警告] OTP {candidate_code} 校验失败(可能过期)，加入黑名单继续等待: {val2.text[:100]}")
+                                baseline_codes.add(candidate_code)
+                            
+                    if otp2 or session_locked:
                         break
+
                     elapsed = int(time.monotonic() - otp_start)
                     # 超过重发间隔则重新触发 OTP 发送
                     if time.monotonic() - otp_last_send >= otp_resend_interval:
-                        print(f"[otp-login] {otp_resend_interval}s 未收到 OTP，重新触发发送...")
+                        print(f"[otp-login] {otp_resend_interval}s 未收到有效 OTP，重新触发发送...")
                         try:
+                            otp_send_time = time.time()
                             rr2 = s2.get(
                                 "https://auth.openai.com/api/accounts/email-otp/send",
                                 headers={"referer": "https://auth.openai.com/email-verification", "accept": "application/json"},
@@ -1388,47 +1690,35 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                         except Exception as _re2:
                             print(f"[otp-login] 重发失败: {_re2}")
                         otp_last_send = time.monotonic()
+                        
                     print(f"[otp-login] 轮询 #{otp_attempt} ({elapsed}s/{email_timeout}s), 还未收到新 OTP...")
                     time.sleep(8)
 
                 if not otp2:
-                    print("[失败] 未收到登录 OTP")
+                    print("[失败] 最终未能收到并验证有效的登录 OTP")
                     continue
-                print(f"[成功] 捕获登录 OTP: {otp2}")
-
-                val2 = s2.post(
-                    "https://auth.openai.com/api/accounts/email-otp/validate",
-                    headers={
-                        "referer": "https://auth.openai.com/email-verification",
-                        "accept": "application/json",
-                        "content-type": "application/json",
-                    },
-                    json={"code": otp2},
-                    timeout=15,
-                )
-                print(f"[日志] 登录 OTP 校验状态: {val2.status_code}")
-                if val2.status_code != 200:
-                    print(f"[失败] 登录 OTP 校验失败: {val2.text[:200]}")
-                    continue
-                val2_data = val2.json() or {}
-                print("[成功] 登录 OTP 验证成功")
 
                 consent_url = str(val2_data.get("continue_url") or "").strip()
                 consent_data = {}
                 if consent_url:
                     consent_resp = s2.get(consent_url, timeout=15)
+                    print(f"[日志] consent_url 状态: {consent_resp.status_code} | url: {consent_url[:200]}")
+                    print(f"[日志] consent_url 响应摘要: {consent_resp.text[:500]}")
                     try:
                         consent_data = consent_resp.json() or {}
+                        print(f"[日志] consent_url JSON keys: {list(consent_data.keys())}")
                     except Exception:
                         consent_data = {}
+                        print("[日志] consent_url 不是 JSON 响应")
 
                 auth_cookie = s2.cookies.get("oai-client-auth-session", domain=".auth.openai.com") or s2.cookies.get("oai-client-auth-session")
                 if not auth_cookie:
                     print("[失败] 登录后未能获取 oai-client-auth-session")
                     continue
                 auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
+                print(f"[日志] auth_cookie 字段: {list(auth_json.keys())}")
 
-                # ── workspace 获取（三层兜底）──────────────────────────────
+                # ── workspace 获取（四层兜底）──────────────────────────────
                 workspace_id = ""
                 sel_data = {}
 
@@ -1446,19 +1736,24 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                         workspace_id = str(ws_from_consent).strip()
                         print(f"[成功] Workspace ID (from consent response): {workspace_id}")
 
-                # 层3：POST workspace/select 不带 ID，让 OpenAI 返回默认 workspace
+                # 层3：POST workspace/select 不带 ID，让 OpenAI 返回默认 workspace / continue_url
                 if not workspace_id:
                     print("[*] Cookie 无 workspaces（新账号），尝试直接调用 workspace/select...")
                     try:
                         ws_resp = s2.post(
                             "https://auth.openai.com/api/accounts/workspace/select",
-                            headers={"referer": consent_url or "https://auth.openai.com/", "accept": "application/json", "content-type": "application/json"},
+                            headers={
+                                "referer": consent_url or "https://auth.openai.com/",
+                                "accept": "application/json",
+                                "content-type": "application/json",
+                            },
                             json={},
                             timeout=15,
                         )
                         print(f"[日志] workspace/select(空) 状态: {ws_resp.status_code} | body: {ws_resp.text[:300]}")
                         ws_data = ws_resp.json() if ws_resp.status_code == 200 else {}
-                        # 如果直接返回了 continue_url，则跳过 workspace_id 走重定向
+                        if ws_data:
+                            print(f"[日志] workspace/select(空) JSON keys: {list(ws_data.keys())}")
                         if ws_data.get("continue_url"):
                             sel_data = ws_data
                             workspace_id = "__skip__"
@@ -1471,21 +1766,22 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                 # 层4：兜底 —— 直接跟踪 consent_url 的重定向链，碰运气找到 localhost callback
                 if not workspace_id:
                     print("[*] 尝试直接跟踪 consent_url 重定向链获取 OAuth callback...")
-                    cbk = None  # 预先初始化，避免 NameError
+                    cbk = None
                     try:
                         r0 = s2.get(consent_url, allow_redirects=False, timeout=15)
                         for _i in range(20):
                             loc0 = r0.headers.get("Location", "")
+                            print(f"  -> [兜底] 重定向 #{_i+1} 状态: {r0.status_code} | 下一跳: {loc0[:80] if loc0 else '无'}")
                             if loc0.startswith("http://localhost"):
                                 cbk = loc0
                                 break
                             if r0.status_code not in (301, 302, 303) or not loc0:
                                 break
                             r0 = s2.get(loc0, allow_redirects=False, timeout=15)
-                        # for...else: 20次循环用尽仍未找到 callback，cbk 保持 None
                     except Exception as _cbk_ex:
                         print(f"[*] 跟踪重定向链异常: {_cbk_ex}")
                         cbk = None
+                        
                     if cbk:
                         token_json = submit_callback_url(
                             callback_url=cbk, expected_state=oauth2.state,
@@ -1516,6 +1812,7 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                         print(f"[失败] Workspace 选择失败: {select_resp.text[:200]}")
                         continue
                     sel_data = select_resp.json() or {}
+                    print(f"[日志] Workspace 选择响应: {json.dumps(sel_data, ensure_ascii=False)[:500]}")
 
                 if sel_data.get("page", {}).get("type", "") == "organization_select":
                     orgs = sel_data.get("page", {}).get("payload", {}).get("data", {}).get("orgs", [])
