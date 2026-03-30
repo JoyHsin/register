@@ -75,6 +75,46 @@ CPA_RETRIES="1"
 CPA_USED_THRESHOLD="95"
 ```
 
+### CPA Codex OAuth（方案 1）
+
+用于不再本地硬走 OpenAI 登录，而是改成：
+1. 向 CPA 申请一条 Codex 授权链接
+2. 在浏览器里完成 OpenAI 登录授权
+3. 把浏览器地址栏里的 `http://localhost:1455/auth/callback?...` 整段回调 URL 提交回 CPA
+4. 由 CPA 生成并落库 Codex 凭证
+
+常用方式：
+
+```bash
+# 方式 A：脚本发起授权，手动粘贴 localhost 回调 URL
+uv run python openai_register.py --cpa-codex-oauth
+
+# 方式 A2：脚本自动监听 localhost:1455，浏览器回跳后自动提交给 CPA
+uv run python openai_register.py --cpa-codex-oauth --cpa-oauth-open-browser
+
+# 方式 B：只打印授权链接并轮询状态，不阻塞等待输入
+uv run python openai_register.py --cpa-codex-oauth --cpa-oauth-no-prompt
+
+# 方式 C：你已经拿到了 localhost 回调 URL，直接提交
+uv run python openai_register.py \
+  --cpa-oauth-callback-url 'http://localhost:1455/auth/callback?code=...&state=...'
+
+# 方式 D：继续轮询某个已有 state
+uv run python openai_register.py --cpa-oauth-state your_state_here
+```
+
+可选环境变量：
+
+```env
+CPA_OAUTH_POLL_INTERVAL="5"
+CPA_OAUTH_TIMEOUT="900"
+CPA_OAUTH_OPEN_BROWSER="false"
+CPA_OAUTH_NO_PROMPT="false"
+CPA_OAUTH_LISTEN="true"
+CPA_OAUTH_LISTEN_HOST="localhost"
+CPA_OAUTH_LISTEN_PORT="1455"
+```
+
 ### 运行行为
 
 ```env
