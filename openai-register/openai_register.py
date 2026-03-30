@@ -9,6 +9,8 @@ import secrets
 import hashlib
 import base64
 import argparse
+import webbrowser
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -16,6 +18,7 @@ from typing import Any, Dict, Optional, List
 import urllib.parse
 import urllib.request
 import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import asyncio
 import requests as py_requests
@@ -105,6 +108,11 @@ DEFAULT_CPA_TIMEOUT = int(os.getenv("CPA_TIMEOUT") or "12")
 DEFAULT_CPA_RETRIES = int(os.getenv("CPA_RETRIES") or "1")
 DEFAULT_CPA_USED_THRESHOLD = int(os.getenv("CPA_USED_THRESHOLD") or "95")
 DEFAULT_CPA_TARGET_COUNT = int(os.getenv("CPA_TARGET_COUNT") or "300")
+DEFAULT_CPA_OAUTH_POLL_INTERVAL = int(os.getenv("CPA_OAUTH_POLL_INTERVAL") or "5")
+DEFAULT_CPA_OAUTH_TIMEOUT = int(os.getenv("CPA_OAUTH_TIMEOUT") or "900")
+DEFAULT_CPA_OAUTH_OPEN_BROWSER = _as_bool(os.getenv("CPA_OAUTH_OPEN_BROWSER"))
+DEFAULT_CPA_OAUTH_NO_PROMPT = _as_bool(os.getenv("CPA_OAUTH_NO_PROMPT"))
+DEFAULT_CPA_OAUTH_LISTEN = _as_bool(os.getenv("CPA_OAUTH_LISTEN") if os.getenv("CPA_OAUTH_LISTEN") is not None else "true")
 DEFAULT_CPA_UPLOAD = _as_bool(os.getenv("CPA_UPLOAD"))
 DEFAULT_CPA_CLEAN = _as_bool(os.getenv("CPA_CLEAN"))
 DEFAULT_PRUNE_LOCAL = _as_bool(os.getenv("PRUNE_LOCAL"))
@@ -143,6 +151,7 @@ _OTP_PATTERNS = [
 ]
 
 OTP_TIME_SKEW_SEC = 120.0
+LOGIN_OTP_INITIAL_SEND_GRACE_SEC = max(0, int(os.getenv("LOGIN_OTP_INITIAL_SEND_GRACE_SEC") or "20"))
 
 
 @dataclass(frozen=True)
@@ -150,6 +159,34 @@ class OtpCandidate:
     code: str
     received_ts: Optional[float]
     source: str = ""
+
+
+@dataclass
+class LocalOAuthCallbackCapture:
+    callback_url: str = ""
+    error: str = ""
+
+
+@dataclass
+class LocalOAuthCallbackServer:
+    httpd: ThreadingHTTPServer
+    thread: threading.Thread
+    capture: LocalOAuthCallbackCapture
+    event: threading.Event
+    host: str
+    port: int
+
+    def shutdown(self) -> None:
+        try:
+            self.httpd.shutdown()
+        except Exception:
+            pass
+        try:
+            self.httpd.server_close()
+        except Exception:
+            pass
+        if self.thread.is_alive():
+            self.thread.join(timeout=2)
 
 
 def _unique_codes_in_order(values: List[str]) -> List[str]:
@@ -252,11 +289,65 @@ def _parse_provider_message_timestamp(data: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _min_allowed_otp_timestamp(min_received_ts: Optional[float], time_skew_sec: float = OTP_TIME_SKEW_SEC) -> Optional[float]:
+    if min_received_ts is None:
+        return None
+    return min_received_ts - max(0.0, float(time_skew_sec))
+
+
 def _sort_otp_candidates(candidates: List[OtpCandidate]) -> List[OtpCandidate]:
     return sorted(
         candidates,
         key=lambda item: (item.received_ts if item.received_ts is not None else float("-inf")),
         reverse=True,
+    )
+
+
+def _start_local_oauth_callback_server(host: str = "localhost", port: int = 1455) -> LocalOAuthCallbackServer:
+    capture = LocalOAuthCallbackCapture()
+    done_event = threading.Event()
+
+    class _CallbackHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args) -> None:
+            return
+
+        def do_GET(self) -> None:
+            raw_path = str(self.path or "")
+            callback_url = f"http://localhost:{port}{raw_path}"
+            parsed = _parse_callback_url(callback_url)
+            if parsed.get("code") and parsed.get("state"):
+                capture.callback_url = callback_url
+                done_event.set()
+                body = (
+                    "<html><body><h1>Codex OAuth callback captured</h1>"
+                    "<p>You can close this tab and return to the terminal.</p></body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+            else:
+                capture.error = raw_path
+                body = (
+                    "<html><body><h1>Callback received but missing code/state</h1>"
+                    "<p>Please return to the terminal to inspect logs.</p></body></html>"
+                ).encode("utf-8")
+                self.send_response(400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            self.wfile.flush()
+            self.close_connection = True
+
+    httpd = ThreadingHTTPServer((host, port), _CallbackHandler)
+    thread = threading.Thread(target=httpd.serve_forever, name="cpa-oauth-callback-server", daemon=True)
+    thread.start()
+    return LocalOAuthCallbackServer(
+        httpd=httpd,
+        thread=thread,
+        capture=capture,
+        event=done_event,
+        host=host,
+        port=port,
     )
 
 
@@ -402,17 +493,23 @@ class CustomDomainMailClient:
                 return True
         return False
 
-    def extract_candidates_for(self, target_email: str, n: int = 30, min_received_ts: Optional[float] = None) -> List[OtpCandidate]:
+    def extract_candidates_for(
+        self,
+        target_email: str,
+        n: int = 30,
+        min_received_ts: Optional[float] = None,
+        time_skew_sec: float = OTP_TIME_SKEW_SEC,
+    ) -> List[OtpCandidate]:
         """取最新 n 封邮件，返回发给 target_email 的验证码候选及接收时间"""
         candidates: List[OtpCandidate] = []
         entries = self._fetch_latest_msg_entries(n)
+        min_allowed_ts = _min_allowed_otp_timestamp(min_received_ts, time_skew_sec=time_skew_sec)
         for msg, received_ts in entries:
             fr = _decode_mime_str(msg.get("From", ""))
             subj = _decode_mime_str(msg.get("Subject", ""))
             if not self._msg_targets_email(msg, target_email):
                 continue
             received_ts = received_ts or _parse_timestamp_value(_decode_mime_str(msg.get("Date", "")))
-            min_allowed_ts = (min_received_ts - OTP_TIME_SKEW_SEC) if min_received_ts is not None else None
             if min_allowed_ts is not None and (received_ts is None or received_ts < min_allowed_ts):
                 continue
             body = self._get_body(msg)
@@ -424,9 +521,23 @@ class CustomDomainMailClient:
                 candidates.append(OtpCandidate(code=code, received_ts=received_ts, source="custom-imap"))
         return _sort_otp_candidates(candidates)
 
-    def extract_codes_for(self, target_email: str, n: int = 30, min_received_ts: Optional[float] = None) -> List[str]:
+    def extract_codes_for(
+        self,
+        target_email: str,
+        n: int = 30,
+        min_received_ts: Optional[float] = None,
+        time_skew_sec: float = OTP_TIME_SKEW_SEC,
+    ) -> List[str]:
         """取最新 n 封邮件，返回发给 target_email 的所有 6 位验证码列表"""
-        return [item.code for item in self.extract_candidates_for(target_email, n=n, min_received_ts=min_received_ts)]
+        return [
+            item.code
+            for item in self.extract_candidates_for(
+                target_email,
+                n=n,
+                min_received_ts=min_received_ts,
+                time_skew_sec=time_skew_sec,
+            )
+        ]
 
     def fetch_code(
         self,
@@ -435,13 +546,14 @@ class CustomDomainMailClient:
         poll: float = 6.0,
         exclude_codes: Optional[List[str]] = None,
         min_received_ts: Optional[float] = None,
+        time_skew_sec: float = OTP_TIME_SKEW_SEC,
     ) -> Optional[str]:
         exclude = set(exclude_codes or [])
         start = time.monotonic()
         attempt = 0
         while time.monotonic() - start < timeout_sec:
             attempt += 1
-            codes = self.extract_codes_for(target_email, min_received_ts=min_received_ts)
+            codes = self.extract_codes_for(target_email, min_received_ts=min_received_ts, time_skew_sec=time_skew_sec)
             print(f"[otp][custom] 轮询 #{attempt}, 共匹配 {len(codes)} 个候选码, 收件目标: {target_email}")
             for code in codes:
                 if code not in exclude:
@@ -579,9 +691,12 @@ def get_email_and_code_fetcher(proxies: Any = None, provider: str = "auto"):
             except Exception:
                 return []
 
-        def _extract_code_candidates(min_received_ts: Optional[float] = None) -> List[OtpCandidate]:
+        def _extract_code_candidates(
+            min_received_ts: Optional[float] = None,
+            time_skew_sec: float = OTP_TIME_SKEW_SEC,
+        ) -> List[OtpCandidate]:
             try:
-                return client.extract_candidates_for(email, min_received_ts=min_received_ts)
+                return client.extract_candidates_for(email, min_received_ts=min_received_ts, time_skew_sec=time_skew_sec)
             except Exception:
                 return []
 
@@ -590,8 +705,16 @@ def get_email_and_code_fetcher(proxies: Any = None, provider: str = "auto"):
             poll: float = 6.0,
             exclude_codes: Optional[List[str]] = None,
             min_received_ts: Optional[float] = None,
+            time_skew_sec: float = OTP_TIME_SKEW_SEC,
         ) -> str | None:
-            return client.fetch_code(email, timeout_sec=timeout_sec, poll=poll, exclude_codes=exclude_codes, min_received_ts=min_received_ts)
+            return client.fetch_code(
+                email,
+                timeout_sec=timeout_sec,
+                poll=poll,
+                exclude_codes=exclude_codes,
+                min_received_ts=min_received_ts,
+                time_skew_sec=time_skew_sec,
+            )
 
         return email, _gen_password(), fetch_code, _extract_all_codes, _extract_code_candidates, "custom", client
 
@@ -611,13 +734,16 @@ def get_email_and_code_fetcher(proxies: Any = None, provider: str = "auto"):
                 pass
             return _sort_otp_candidates(results)
 
-        def _extract_code_candidates(min_received_ts: Optional[float] = None) -> List[OtpCandidate]:
+        def _extract_code_candidates(
+            min_received_ts: Optional[float] = None,
+            time_skew_sec: float = OTP_TIME_SKEW_SEC,
+        ) -> List[OtpCandidate]:
             results: List[OtpCandidate] = []
             try:
                 msgs = inbox._get_messages()
+                min_allowed_ts = _min_allowed_otp_timestamp(min_received_ts, time_skew_sec=time_skew_sec)
                 for msg_data in msgs:
                     received_ts = _parse_provider_message_timestamp(msg_data)
-                    min_allowed_ts = (min_received_ts - OTP_TIME_SKEW_SEC) if min_received_ts is not None else None
                     if min_allowed_ts is not None and (received_ts is None or received_ts < min_allowed_ts):
                         continue
                     msg = Message(msg_data)
@@ -633,6 +759,7 @@ def get_email_and_code_fetcher(proxies: Any = None, provider: str = "auto"):
             poll: float = 6.0,
             exclude_codes: Optional[List[str]] = None,
             min_received_ts: Optional[float] = None,
+            time_skew_sec: float = OTP_TIME_SKEW_SEC,
         ) -> str | None:
             exclude = set(exclude_codes or [])
             start = time.monotonic()
@@ -640,7 +767,7 @@ def get_email_and_code_fetcher(proxies: Any = None, provider: str = "auto"):
             while time.monotonic() - start < timeout_sec:
                 attempt += 1
                 try:
-                    candidates = _extract_code_candidates(min_received_ts=min_received_ts)
+                    candidates = _extract_code_candidates(min_received_ts=min_received_ts, time_skew_sec=time_skew_sec)
                     print(f"[otp][tempmail] 轮询 #{attempt}, 共匹配 {len(candidates)} 个候选码, 目标: {email}")
                     for candidate in candidates:
                         if candidate.code not in exclude:
@@ -673,13 +800,16 @@ def get_email_and_code_fetcher(proxies: Any = None, provider: str = "auto"):
                 pass
             return results
 
-        def _extract_code_candidates(min_received_ts: Optional[float] = None) -> List[OtpCandidate]:
+        def _extract_code_candidates(
+            min_received_ts: Optional[float] = None,
+            time_skew_sec: float = OTP_TIME_SKEW_SEC,
+        ) -> List[OtpCandidate]:
             results: List[OtpCandidate] = []
             try:
                 summaries = client.list_emails(email)
+                min_allowed_ts = _min_allowed_otp_timestamp(min_received_ts, time_skew_sec=time_skew_sec)
                 for s in summaries:
                     received_ts = _parse_provider_message_timestamp(s)
-                    min_allowed_ts = (min_received_ts - OTP_TIME_SKEW_SEC) if min_received_ts is not None else None
                     if min_allowed_ts is not None and (received_ts is None or received_ts < min_allowed_ts):
                         continue
                     subject = str(s.get("subject", "") or "")
@@ -700,6 +830,7 @@ def get_email_and_code_fetcher(proxies: Any = None, provider: str = "auto"):
             poll: float = 6.0,
             exclude_codes: Optional[List[str]] = None,
             min_received_ts: Optional[float] = None,
+            time_skew_sec: float = OTP_TIME_SKEW_SEC,
         ) -> str | None:
             exclude = set(exclude_codes or [])
             start = time.monotonic()
@@ -707,7 +838,7 @@ def get_email_and_code_fetcher(proxies: Any = None, provider: str = "auto"):
             while time.monotonic() - start < timeout_sec:
                 attempt += 1
                 try:
-                    candidates = _extract_code_candidates(min_received_ts=min_received_ts)
+                    candidates = _extract_code_candidates(min_received_ts=min_received_ts, time_skew_sec=time_skew_sec)
                     print(f"[otp][gptmail] 轮询 #{attempt}, 共匹配 {len(candidates)} 个候选码, 目标: {email}")
                     for candidate in candidates:
                         if candidate.code not in exclude:
@@ -1146,6 +1277,13 @@ def _get_item_type(item: dict) -> str:
     return str(item.get("type") or item.get("typo") or "")
 
 
+def _http_proxies(proxy: str = "") -> Optional[Dict[str, str]]:
+    clean = str(proxy or "").strip()
+    if not clean:
+        return None
+    return {"http": clean, "https": clean}
+
+
 class MiniPoolMaintainer:
     def __init__(self, base_url: str, token: str, target_type: str = "codex", used_percent_threshold: int = 95, user_agent: str = DEFAULT_MGMT_UA):
         self.base_url = (base_url or "").rstrip("/")
@@ -1160,7 +1298,7 @@ class MiniPoolMaintainer:
         content = json.dumps(token_data, ensure_ascii=False).encode("utf-8")
         files = {"file": (filename, content, "application/json")}
         headers = {"Authorization": f"Bearer {self.token}"}
-        proxies = {"http": proxy, "https": proxy} if proxy else None
+        proxies = _http_proxies(proxy)
         for attempt in range(3):
             try:
                 resp = py_requests.post(_join_mgmt_url(self.base_url, "/management/auth-files"), files=files, headers=headers, timeout=30, verify=False, proxies=proxies)
@@ -1177,6 +1315,43 @@ class MiniPoolMaintainer:
         resp.raise_for_status()
         data = resp.json()
         return (data.get("files") if isinstance(data, dict) else []) or []
+
+    def request_codex_oauth_url(self, timeout: int = 30, proxy: str = "", is_webui: bool = True) -> dict:
+        headers = {**_mgmt_headers(self.token), "User-Agent": self.user_agent}
+        params = {"is_webui": "true"} if is_webui else None
+        resp = py_requests.get(
+            _join_mgmt_url(self.base_url, "/management/codex-auth-url"),
+            headers=headers,
+            params=params,
+            timeout=timeout,
+            proxies=_http_proxies(proxy),
+        )
+        resp.raise_for_status()
+        return resp.json() if resp.text else {}
+
+    def get_oauth_status(self, state: str, timeout: int = 15, proxy: str = "") -> dict:
+        headers = {**_mgmt_headers(self.token), "User-Agent": self.user_agent}
+        resp = py_requests.get(
+            _join_mgmt_url(self.base_url, "/management/get-auth-status"),
+            headers=headers,
+            params={"state": state},
+            timeout=timeout,
+            proxies=_http_proxies(proxy),
+        )
+        resp.raise_for_status()
+        return resp.json() if resp.text else {}
+
+    def submit_oauth_callback(self, provider: str, redirect_url: str, timeout: int = 30, proxy: str = "") -> dict:
+        headers = {**_mgmt_headers(self.token), "User-Agent": self.user_agent, "Content-Type": "application/json"}
+        resp = py_requests.post(
+            _join_mgmt_url(self.base_url, "/management/oauth-callback"),
+            headers=headers,
+            json={"provider": provider, "redirect_url": redirect_url},
+            timeout=timeout,
+            proxies=_http_proxies(proxy),
+        )
+        resp.raise_for_status()
+        return resp.json() if resp.text else {}
 
     async def probe_and_clean_async(self, workers: int = 20, timeout: int = 10, retries: int = 1):
         if aiohttp is None:
@@ -1338,6 +1513,131 @@ def _count_valid_cpa_tokens(pm, args):
     except Exception as e:
         print(f"[CPA] 统计 token 失败: {e}")
         return 0
+
+
+def _run_cpa_codex_oauth(args, pm) -> int:
+    if not pm:
+        print("[CPA OAuth] 未配置 cpa_base_url / cpa_token，无法发起 OAuth。")
+        return 1
+
+    callback_server = None
+    if args.cpa_oauth_listen and not str(args.cpa_oauth_callback_url or "").strip():
+        try:
+            callback_server = _start_local_oauth_callback_server(
+                host=str(args.cpa_oauth_listen_host or "localhost").strip() or "localhost",
+                port=max(1, int(args.cpa_oauth_listen_port or 1455)),
+            )
+            print(f"[CPA OAuth] 已启动本地回调监听: http://{callback_server.host}:{callback_server.port}/auth/callback")
+        except Exception as e:
+            print(f"[CPA OAuth] 启动本地回调监听失败: {e}")
+            if args.cpa_oauth_no_prompt:
+                return 1
+            print("[CPA OAuth] 将回退到手动粘贴 localhost 回调 URL。")
+
+    callback_url = str(args.cpa_oauth_callback_url or "").strip()
+    callback_state = _parse_callback_url(callback_url).get("state", "") if callback_url else ""
+    state = str(args.cpa_oauth_state or callback_state or "").strip()
+    auth_url = ""
+    should_request_auth = bool(args.cpa_codex_oauth) or not state
+
+    if should_request_auth:
+        try:
+            payload = pm.request_codex_oauth_url(timeout=max(10, args.cpa_timeout), proxy=args.proxy or "", is_webui=True)
+        except Exception as e:
+            print(f"[CPA OAuth] 获取 Codex 授权链接失败: {e}")
+            return 1
+        auth_url = str(payload.get("url") or "").strip()
+        state = str(payload.get("state") or state).strip()
+        if not state and auth_url:
+            try:
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(auth_url).query, keep_blank_values=True)
+                state = (query.get("state", [""])[0] or "").strip()
+            except Exception:
+                state = state or ""
+        print(f"[CPA OAuth] state: {state or '(空)'}")
+        print(f"[CPA OAuth] 授权链接:\n{auth_url}")
+        print("[CPA OAuth] 完成浏览器登录后，把地址栏里的 localhost 回调 URL 整段粘回来即可。")
+        if args.cpa_oauth_open_browser and auth_url:
+            try:
+                opened = webbrowser.open(auth_url)
+                print(f"[CPA OAuth] 已请求打开浏览器: {'成功' if opened else '失败/被忽略'}")
+            except Exception as e:
+                print(f"[CPA OAuth] 打开浏览器失败: {e}")
+
+    if not state:
+        print("[CPA OAuth] 未拿到 state，无法轮询状态。")
+        return 1
+
+    try:
+        submitted_callback = False
+        if callback_url:
+            try:
+                result = pm.submit_oauth_callback("codex", callback_url, timeout=max(10, args.cpa_timeout), proxy=args.proxy or "")
+                print(f"[CPA OAuth] 提交回调成功: {json.dumps(result, ensure_ascii=False)}")
+                submitted_callback = True
+            except Exception as e:
+                print(f"[CPA OAuth] 提交回调失败: {e}")
+                return 1
+        elif not args.cpa_oauth_no_prompt and not callback_server:
+            user_input = input("[CPA OAuth] 粘贴完整 localhost 回调 URL（直接回车则只轮询状态，输入 q 退出）: ").strip()
+            if user_input.lower() in {"q", "quit", "exit"}:
+                print("[CPA OAuth] 用户取消。")
+                return 0
+            if user_input:
+                try:
+                    result = pm.submit_oauth_callback("codex", user_input, timeout=max(10, args.cpa_timeout), proxy=args.proxy or "")
+                    print(f"[CPA OAuth] 提交回调成功: {json.dumps(result, ensure_ascii=False)}")
+                    submitted_callback = True
+                except Exception as e:
+                    print(f"[CPA OAuth] 提交回调失败: {e}")
+                    return 1
+
+        started_at = time.monotonic()
+        poll_interval = max(1, int(args.cpa_oauth_poll_interval))
+        timeout_sec = max(30, int(args.cpa_oauth_timeout))
+
+        while time.monotonic() - started_at < timeout_sec:
+            elapsed = int(time.monotonic() - started_at)
+            if callback_server and not submitted_callback and callback_server.event.is_set():
+                auto_callback_url = callback_server.capture.callback_url
+                if auto_callback_url:
+                    print(f"[CPA OAuth] 已自动捕获 localhost 回调: {auto_callback_url}")
+                    try:
+                        result = pm.submit_oauth_callback("codex", auto_callback_url, timeout=max(10, args.cpa_timeout), proxy=args.proxy or "")
+                        print(f"[CPA OAuth] 自动提交回调成功: {json.dumps(result, ensure_ascii=False)}")
+                        submitted_callback = True
+                    except Exception as e:
+                        print(f"[CPA OAuth] 自动提交回调失败: {e}")
+                        return 1
+
+            try:
+                status_payload = pm.get_oauth_status(state, timeout=max(10, args.cpa_timeout), proxy=args.proxy or "")
+            except Exception as e:
+                print(f"[CPA OAuth] 查询状态失败: {e}")
+                return 1
+
+            status = str(status_payload.get("status") or "").strip().lower() or "wait"
+            error_text = str(status_payload.get("error") or "").strip()
+            print(f"[CPA OAuth] 状态: {status} ({elapsed}s/{timeout_sec}s)")
+            if error_text:
+                print(f"[CPA OAuth] 错误: {error_text}")
+
+            if status == "ok":
+                print("[CPA OAuth] OAuth 流程完成，请到 CPA 的 Auth Files 查看新生成的 Codex 凭证。")
+                return 0
+            if status == "error":
+                return 1
+
+            if callback_server and not submitted_callback:
+                callback_server.event.wait(timeout=min(poll_interval, 1))
+            else:
+                time.sleep(poll_interval)
+
+        print(f"[CPA OAuth] 超时：{timeout_sec}s 内未完成 OAuth 流程。")
+        return 1
+    finally:
+        if callback_server:
+            callback_server.shutdown()
 
 
 # 账号行清理：上传成功且开启 prune_local 后使用
@@ -1587,28 +1887,18 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                     print(f"[失败] 登录密码验证失败: {pw.text[:200]}")
                     continue
 
-                # 记录触发登录 OTP 前 IMAP 中已有的所有邮件的验证码（作为排除基线）
-                existing_codes = list(extract_all_codes())
-                baseline_codes = set(existing_codes)
-                baseline_codes.add(first_code)  # 排除注册流程的 OTP
+                # 登录阶段只依赖“本次 OTP 会话开始时间”过滤旧邮件；
+                # 不再按纯 code 做基线排除，因为登录码可能与注册码重复。
+                attempted_codes: set[str] = set()
 
-                # 触发登录 OTP 发送 —— 密码验证完成后 OpenAI 会跳转到邮件验证页面
-                otp_send_time = time.time()  # 记录触发时间，用于过滤旧邮件
+                # 进入邮件验证页后，OpenAI 通常会自动发送一封登录 OTP。
+                # 这里先依赖自动发送，避免“页面自动发一封 + 主动接口再发一封”导致同时出现两条验证码。
+                otp_send_time = time.time()  # 记录本次登录 OTP 会话开始时间，用于过滤更早流程里的旧邮件
                 s2.get(
                     "https://auth.openai.com/email-verification",
                     headers={"referer": "https://auth.openai.com/log-in/password"},
                     timeout=15,
                 )
-                # 主动触发 OTP 发送接口
-                try:
-                    _otp_trigger = s2.get(
-                        "https://auth.openai.com/api/accounts/email-otp/send",
-                        headers={"referer": "https://auth.openai.com/email-verification", "accept": "application/json"},
-                        timeout=15,
-                    )
-                    print(f"[otp-login] 触发登录 OTP 发送状态: {_otp_trigger.status_code}")
-                except Exception as _ote:
-                    print(f"[otp-login] 触发 OTP 发送失败（将等待自动发送）: {_ote}")
 
                 print(f"[*] 正在等待登录 OTP（超时 {email_timeout}s，每 {otp_resend_interval}s 无码自动重发）...")
                 # 等待几秒让邮件到达 IMAP
@@ -1619,15 +1909,18 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                 otp_last_send = otp_start
                 otp_attempt = 0
                 val2_data = {}
+                initial_send_requested = False
                 
                 while time.monotonic() - otp_start < email_timeout:
                     otp_attempt += 1
-                    all_candidates = _sort_otp_candidates(extract_code_candidates(min_received_ts=otp_send_time))
-                    # 只接受基线快照之后出现的候选，并按收到时间从新到旧去重
+                    all_candidates = _sort_otp_candidates(
+                        extract_code_candidates(min_received_ts=otp_send_time, time_skew_sec=0.0)
+                    )
+                    # 只接受本次登录 OTP 会话时间窗内的候选，并按收到时间从新到旧去重
                     new_candidates: List[OtpCandidate] = []
                     seen_codes = set()
                     for candidate in all_candidates:
-                        if candidate.code in baseline_codes or candidate.code in seen_codes:
+                        if candidate.code in attempted_codes or candidate.code in seen_codes:
                             continue
                         seen_codes.add(candidate.code)
                         new_candidates.append(candidate)
@@ -1664,22 +1957,42 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                             err_code = (val2.json() or {}).get("error", {}).get("code", "")
                             if err_code == "max_check_attempts":
                                 print(f"[警告] 校验次数超限(max_check_attempts)，OTP会话已锁定，放弃本轮等待！")
-                                baseline_codes.add(candidate_code)
+                                attempted_codes.add(candidate_code)
                                 session_locked = True
                                 break
                             else:
                                 print(f"[警告] OTP {candidate_code} 校验失败(可能过期)，加入黑名单继续等待: {val2.text[:100]}")
-                                baseline_codes.add(candidate_code)
+                                attempted_codes.add(candidate_code)
                             
                     if otp2 or session_locked:
                         break
 
                     elapsed = int(time.monotonic() - otp_start)
+                    if (
+                        not initial_send_requested
+                        and not new_candidates
+                        and elapsed >= LOGIN_OTP_INITIAL_SEND_GRACE_SEC
+                    ):
+                        print(
+                            f"[otp-login] {LOGIN_OTP_INITIAL_SEND_GRACE_SEC}s 内未收到自动发送的 OTP，主动触发一次发送..."
+                        )
+                        try:
+                            rr_init = s2.get(
+                                "https://auth.openai.com/api/accounts/email-otp/send",
+                                headers={"referer": "https://auth.openai.com/email-verification", "accept": "application/json"},
+                                timeout=15,
+                            )
+                            print(f"[otp-login] 首次主动发送状态: {rr_init.status_code}")
+                            s2.get("https://auth.openai.com/email-verification", timeout=15)
+                        except Exception as _re_init:
+                            print(f"[otp-login] 首次主动发送失败: {_re_init}")
+                        otp_last_send = time.monotonic()
+                        initial_send_requested = True
+
                     # 超过重发间隔则重新触发 OTP 发送
                     if time.monotonic() - otp_last_send >= otp_resend_interval:
                         print(f"[otp-login] {otp_resend_interval}s 未收到有效 OTP，重新触发发送...")
                         try:
-                            otp_send_time = time.time()
                             rr2 = s2.get(
                                 "https://auth.openai.com/api/accounts/email-otp/send",
                                 headers={"referer": "https://auth.openai.com/email-verification", "accept": "application/json"},
@@ -1945,6 +2258,16 @@ def main():
     parser.add_argument("--cpa-clean", action="store_true", default=DEFAULT_CPA_CLEAN, help="注册后自动清理 CPA 失效账号 [env: CPA_CLEAN]")
     parser.add_argument("--cpa-upload", action="store_true", default=DEFAULT_CPA_UPLOAD, help="注册后自动上传 CPA [env: CPA_UPLOAD]")
     parser.add_argument("--cpa-target-count", type=int, default=DEFAULT_CPA_TARGET_COUNT, help="目标 token 数(有效) [env: CPA_TARGET_COUNT，默认 300]")
+    parser.add_argument("--cpa-codex-oauth", action="store_true", help="通过 CPA 发起 Codex OAuth，并等待回调/状态完成")
+    parser.add_argument("--cpa-oauth-state", default=os.getenv("CPA_OAUTH_STATE"), help="已有 OAuth state，用于继续轮询状态")
+    parser.add_argument("--cpa-oauth-callback-url", default=os.getenv("CPA_OAUTH_CALLBACK_URL"), help="已拿到的 localhost 回调 URL，可直接提交给 CPA")
+    parser.add_argument("--cpa-oauth-poll-interval", type=int, default=DEFAULT_CPA_OAUTH_POLL_INTERVAL, help="OAuth 状态轮询间隔秒数 [env: CPA_OAUTH_POLL_INTERVAL，默认 5]")
+    parser.add_argument("--cpa-oauth-timeout", type=int, default=DEFAULT_CPA_OAUTH_TIMEOUT, help="OAuth 总等待超时秒数 [env: CPA_OAUTH_TIMEOUT，默认 900]")
+    parser.add_argument("--cpa-oauth-open-browser", action="store_true", default=DEFAULT_CPA_OAUTH_OPEN_BROWSER, help="发起授权后尝试自动打开浏览器 [env: CPA_OAUTH_OPEN_BROWSER]")
+    parser.add_argument("--cpa-oauth-no-prompt", action="store_true", default=DEFAULT_CPA_OAUTH_NO_PROMPT, help="OAuth 模式下不等待手动粘贴回调 URL，只轮询状态 [env: CPA_OAUTH_NO_PROMPT]")
+    parser.add_argument("--cpa-oauth-listen", action="store_true", default=DEFAULT_CPA_OAUTH_LISTEN, help="在 localhost:1455 自动监听 OAuth 回调并提交给 CPA [env: CPA_OAUTH_LISTEN]")
+    parser.add_argument("--cpa-oauth-listen-host", default=os.getenv("CPA_OAUTH_LISTEN_HOST", "localhost"), help="本地 OAuth 回调监听 host [env: CPA_OAUTH_LISTEN_HOST，默认 localhost]")
+    parser.add_argument("--cpa-oauth-listen-port", type=int, default=int(os.getenv("CPA_OAUTH_LISTEN_PORT") or "1455"), help="本地 OAuth 回调监听端口 [env: CPA_OAUTH_LISTEN_PORT，默认 1455]")
     parser.add_argument("--prune-local", action="store_true", default=DEFAULT_PRUNE_LOCAL, help="上传成功后删除本地 token 文件与账号行 [env: PRUNE_LOCAL]")
     args = parser.parse_args()
 
@@ -1953,6 +2276,16 @@ def main():
 
     sub2api_settings = _resolve_sub2api_settings(args)
     pm = _build_cpa_maintainer(args)
+
+    oauth_mode = any([
+        bool(args.cpa_codex_oauth),
+        bool(str(args.cpa_oauth_state or "").strip()),
+        bool(str(args.cpa_oauth_callback_url or "").strip()),
+        bool(args.cpa_oauth_open_browser),
+        bool(args.cpa_oauth_no_prompt),
+    ])
+    if oauth_mode:
+        raise SystemExit(_run_cpa_codex_oauth(args, pm))
 
     count = 0
     while True:
