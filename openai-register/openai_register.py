@@ -151,7 +151,10 @@ _OTP_PATTERNS = [
 ]
 
 OTP_TIME_SKEW_SEC = 120.0
-LOGIN_OTP_INITIAL_SEND_GRACE_SEC = max(0, int(os.getenv("LOGIN_OTP_INITIAL_SEND_GRACE_SEC") or "20"))
+LOGIN_OTP_INITIAL_SEND_GRACE_SEC = max(0, int(os.getenv("LOGIN_OTP_INITIAL_SEND_GRACE_SEC") or "45"))
+LOGIN_WORKSPACE_SETTLE_TIMEOUT_SEC = max(0, int(os.getenv("LOGIN_WORKSPACE_SETTLE_TIMEOUT_SEC") or "45"))
+LOGIN_WORKSPACE_SETTLE_POLL_SEC = max(1, int(os.getenv("LOGIN_WORKSPACE_SETTLE_POLL_SEC") or "3"))
+CPA_OAUTH_STATUS_ERROR_TOLERANCE = max(1, int(os.getenv("CPA_OAUTH_STATUS_ERROR_TOLERANCE") or "10"))
 
 
 @dataclass(frozen=True)
@@ -301,6 +304,114 @@ def _sort_otp_candidates(candidates: List[OtpCandidate]) -> List[OtpCandidate]:
         key=lambda item: (item.received_ts if item.received_ts is not None else float("-inf")),
         reverse=True,
     )
+
+
+def _get_auth_cookie_payload(session: Any) -> Dict[str, Any]:
+    auth_cookie = session.cookies.get("oai-client-auth-session", domain=".auth.openai.com") or session.cookies.get("oai-client-auth-session")
+    if not auth_cookie:
+        return {}
+    try:
+        return _decode_jwt_segment(auth_cookie.split(".")[0])
+    except Exception:
+        return {}
+
+
+def _follow_redirect_chain(session: Any, start_url: str, timeout: int = 15, max_hops: int = 20) -> Dict[str, Any]:
+    current_url = str(start_url or "").strip()
+    if not current_url:
+        return {"callback_url": "", "final_url": "", "status_code": 0, "error": "empty_start_url"}
+
+    try:
+        resp = session.get(current_url, allow_redirects=False, timeout=timeout)
+        final_url = str(getattr(resp, "url", "") or current_url)
+        for _ in range(max_hops):
+            loc = str(resp.headers.get("Location", "") or "").strip()
+            if loc.startswith("http://localhost"):
+                return {"callback_url": loc, "final_url": loc, "status_code": resp.status_code, "error": ""}
+            if resp.status_code not in (301, 302, 303) or not loc:
+                return {"callback_url": "", "final_url": final_url, "status_code": resp.status_code, "error": ""}
+            resp = session.get(loc, allow_redirects=False, timeout=timeout)
+            final_url = str(getattr(resp, "url", "") or loc)
+        return {"callback_url": "", "final_url": final_url, "status_code": resp.status_code, "error": "max_hops"}
+    except Exception as e:
+        return {"callback_url": "", "final_url": current_url, "status_code": 0, "error": str(e)}
+
+
+def _stabilize_login_session(
+    session: Any,
+    oauth_auth_url: str,
+    consent_url: str,
+    timeout_sec: int = LOGIN_WORKSPACE_SETTLE_TIMEOUT_SEC,
+    poll_sec: int = LOGIN_WORKSPACE_SETTLE_POLL_SEC,
+) -> Dict[str, Any]:
+    current_consent_url = str(consent_url or "").strip()
+    last_auth_json = _get_auth_cookie_payload(session)
+    last_consent_data: Dict[str, Any] = {}
+    callback_url = ""
+    final_oauth_url = ""
+
+    if timeout_sec <= 0:
+        return {
+            "auth_json": last_auth_json,
+            "consent_url": current_consent_url,
+            "consent_data": last_consent_data,
+            "callback_url": callback_url,
+            "oauth_final_url": final_oauth_url,
+        }
+
+    deadline = time.monotonic() + timeout_sec
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        auth_json = _get_auth_cookie_payload(session)
+        if auth_json:
+            last_auth_json = auth_json
+        if last_auth_json.get("workspaces"):
+            break
+
+        oauth_trace = _follow_redirect_chain(session, oauth_auth_url, timeout=15)
+        final_oauth_url = str(oauth_trace.get("final_url") or final_oauth_url or "")
+        callback_url = str(oauth_trace.get("callback_url") or "").strip()
+        if callback_url:
+            break
+
+        candidate_url = ""
+        if final_oauth_url.startswith("https://auth.openai.com/"):
+            candidate_url = final_oauth_url
+        elif current_consent_url:
+            candidate_url = current_consent_url
+
+        if candidate_url:
+            current_consent_url = candidate_url
+            try:
+                consent_resp = session.get(current_consent_url, timeout=15)
+                current_consent_url = str(getattr(consent_resp, "url", "") or current_consent_url)
+                try:
+                    last_consent_data = consent_resp.json() or {}
+                except Exception:
+                    last_consent_data = {}
+            except Exception:
+                pass
+
+        auth_json = _get_auth_cookie_payload(session)
+        if auth_json:
+            last_auth_json = auth_json
+        if last_auth_json.get("workspaces"):
+            break
+
+        remaining = max(0, int(deadline - time.monotonic()))
+        if remaining <= 0:
+            break
+        print(f"[*] 登录会话稳定化轮询 #{attempt}，仍无 workspaces / callback，剩余约 {remaining}s...")
+        time.sleep(min(poll_sec, remaining))
+
+    return {
+        "auth_json": last_auth_json,
+        "consent_url": current_consent_url,
+        "consent_data": last_consent_data,
+        "callback_url": callback_url,
+        "oauth_final_url": final_oauth_url,
+    }
 
 
 def _start_local_oauth_callback_server(host: str = "localhost", port: int = 1455) -> LocalOAuthCallbackServer:
@@ -1570,11 +1681,14 @@ def _run_cpa_codex_oauth(args, pm) -> int:
 
     try:
         submitted_callback = False
+        pending_callback_url = callback_url
+        status_error_count = 0
         if callback_url:
             try:
                 result = pm.submit_oauth_callback("codex", callback_url, timeout=max(10, args.cpa_timeout), proxy=args.proxy or "")
                 print(f"[CPA OAuth] 提交回调成功: {json.dumps(result, ensure_ascii=False)}")
                 submitted_callback = True
+                pending_callback_url = ""
             except Exception as e:
                 print(f"[CPA OAuth] 提交回调失败: {e}")
                 return 1
@@ -1601,20 +1715,32 @@ def _run_cpa_codex_oauth(args, pm) -> int:
             if callback_server and not submitted_callback and callback_server.event.is_set():
                 auto_callback_url = callback_server.capture.callback_url
                 if auto_callback_url:
-                    print(f"[CPA OAuth] 已自动捕获 localhost 回调: {auto_callback_url}")
-                    try:
-                        result = pm.submit_oauth_callback("codex", auto_callback_url, timeout=max(10, args.cpa_timeout), proxy=args.proxy or "")
-                        print(f"[CPA OAuth] 自动提交回调成功: {json.dumps(result, ensure_ascii=False)}")
-                        submitted_callback = True
-                    except Exception as e:
-                        print(f"[CPA OAuth] 自动提交回调失败: {e}")
-                        return 1
+                    pending_callback_url = auto_callback_url
+
+            if pending_callback_url and not submitted_callback:
+                print(f"[CPA OAuth] 已捕获 localhost 回调，尝试提交给 CPA: {pending_callback_url}")
+                try:
+                    result = pm.submit_oauth_callback("codex", pending_callback_url, timeout=max(10, args.cpa_timeout), proxy=args.proxy or "")
+                    print(f"[CPA OAuth] 自动提交回调成功: {json.dumps(result, ensure_ascii=False)}")
+                    submitted_callback = True
+                    pending_callback_url = ""
+                except Exception as e:
+                    print(f"[CPA OAuth] 自动提交回调失败（稍后重试）: {e}")
 
             try:
                 status_payload = pm.get_oauth_status(state, timeout=max(10, args.cpa_timeout), proxy=args.proxy or "")
+                status_error_count = 0
             except Exception as e:
-                print(f"[CPA OAuth] 查询状态失败: {e}")
-                return 1
+                status_error_count += 1
+                print(f"[CPA OAuth] 查询状态失败（第 {status_error_count}/{CPA_OAUTH_STATUS_ERROR_TOLERANCE} 次，稍后重试）: {e}")
+                if status_error_count >= CPA_OAUTH_STATUS_ERROR_TOLERANCE:
+                    print("[CPA OAuth] 连续查询状态失败次数过多，终止本轮 OAuth 轮询。")
+                    return 1
+                if callback_server and not submitted_callback:
+                    callback_server.event.wait(timeout=min(poll_interval, 1))
+                else:
+                    time.sleep(poll_interval)
+                continue
 
             status = str(status_payload.get("status") or "").strip().lower() or "wait"
             error_text = str(status_payload.get("error") or "").strip()
@@ -2068,12 +2194,38 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                     except Exception as _about_you_ex:
                         print(f"[日志] 登录补完 about-you 异常: {_about_you_ex}")
 
-                auth_cookie = s2.cookies.get("oai-client-auth-session", domain=".auth.openai.com") or s2.cookies.get("oai-client-auth-session")
-                if not auth_cookie:
+                auth_json = _get_auth_cookie_payload(s2)
+                if not auth_json:
                     print("[失败] 登录后未能获取 oai-client-auth-session")
                     continue
-                auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
                 print(f"[日志] auth_cookie 字段: {list(auth_json.keys())}")
+
+                if needs_about_you or not auth_json.get("workspaces"):
+                    print("[*] 当前登录会话仍未就绪，尝试稳定化等待 workspace / consent ...")
+                    settled = _stabilize_login_session(
+                        s2,
+                        oauth2.auth_url,
+                        consent_url,
+                        timeout_sec=LOGIN_WORKSPACE_SETTLE_TIMEOUT_SEC,
+                        poll_sec=LOGIN_WORKSPACE_SETTLE_POLL_SEC,
+                    )
+                    direct_cbk = str(settled.get("callback_url") or "").strip()
+                    if direct_cbk:
+                        token_json = submit_callback_url(
+                            callback_url=direct_cbk,
+                            expected_state=oauth2.state,
+                            code_verifier=oauth2.code_verifier,
+                            redirect_uri=oauth2.redirect_uri,
+                            session=s2,
+                        )
+                        print("[大功告成] 账号注册完毕！(登录会话稳定化后直跳 callback)")
+                        return token_json, email, password
+                    consent_url = str(settled.get("consent_url") or consent_url or "").strip()
+                    if settled.get("consent_data"):
+                        consent_data = settled.get("consent_data") or {}
+                    if settled.get("auth_json"):
+                        auth_json = settled.get("auth_json") or auth_json
+                    print(f"[日志] 稳定化后 auth_cookie 字段: {list(auth_json.keys())}")
 
                 # ── workspace 获取（四层兜底）──────────────────────────────
                 workspace_id = ""
