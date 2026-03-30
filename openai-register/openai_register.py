@@ -316,6 +316,264 @@ def _get_auth_cookie_payload(session: Any) -> Dict[str, Any]:
         return {}
 
 
+def _has_cookie(session: Any, cookie_name: str) -> bool:
+    jar = getattr(session.cookies, "jar", None)
+    if jar is not None:
+        return any((getattr(c, "name", "") or "") == cookie_name for c in list(jar))
+    return cookie_name in set(getattr(session.cookies, "keys", lambda: [])())
+
+
+def _extract_code_from_url(url: str) -> str:
+    return str(_parse_callback_url(url).get("code") or "").strip()
+
+
+def _decode_oauth_session_cookie(session: Any) -> Dict[str, Any]:
+    jar = getattr(session.cookies, "jar", None)
+    cookie_items = list(jar) if jar is not None else []
+    for cookie in cookie_items:
+        if "oai-client-auth-session" not in str(getattr(cookie, "name", "") or ""):
+            continue
+
+        raw_val = str(getattr(cookie, "value", "") or "").strip()
+        if not raw_val:
+            continue
+
+        candidates = [raw_val]
+        try:
+            decoded = urllib.parse.unquote(raw_val)
+            if decoded != raw_val:
+                candidates.append(decoded)
+        except Exception:
+            pass
+
+        for candidate in candidates:
+            try:
+                if (candidate.startswith('"') and candidate.endswith('"')) or (candidate.startswith("'") and candidate.endswith("'")):
+                    candidate = candidate[1:-1]
+                part = candidate.split(".")[0] if "." in candidate else candidate
+                pad = "=" * ((4 - (len(part) % 4)) % 4)
+                data = json.loads(base64.urlsafe_b64decode((part + pad).encode("ascii")).decode("utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                continue
+    return {}
+
+
+def _oauth_json_headers(referer: str, did: str, user_agent: str = UA) -> Dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://auth.openai.com",
+        "Referer": referer,
+        "User-Agent": user_agent,
+        "oai-device-id": did,
+    }
+
+
+def _oauth_allow_redirect_extract_code(session: Any, url: str, referer: str | None = None, user_agent: str = UA) -> Optional[str]:
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": user_agent,
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    try:
+        resp = session.get(url, headers=headers, allow_redirects=True, timeout=30)
+        final_url = str(getattr(resp, "url", "") or "")
+        code = _extract_code_from_url(final_url)
+        if code:
+            print("[OAuth] allow_redirect 命中最终 URL code")
+            return code
+
+        for item in getattr(resp, "history", []) or []:
+            loc = str(item.headers.get("Location", "") or "")
+            code = _extract_code_from_url(loc) or _extract_code_from_url(str(getattr(item, "url", "") or ""))
+            if code:
+                print("[OAuth] allow_redirect 命中 history code")
+                return code
+    except Exception as e:
+        localhost_match = re.search(r'(https?://localhost[^\s\'\"]+)', str(e))
+        if localhost_match:
+            code = _extract_code_from_url(localhost_match.group(1))
+            if code:
+                print("[OAuth] allow_redirect 从 localhost 异常提取 code")
+                return code
+        print(f"[OAuth] allow_redirect 异常: {e}")
+    return None
+
+
+def _oauth_follow_for_code(session: Any, start_url: str, referer: str | None = None, user_agent: str = UA, max_hops: int = 16) -> tuple[Optional[str], str]:
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": user_agent,
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    current_url = str(start_url or "").strip()
+    last_url = current_url
+
+    for hop in range(max_hops):
+        try:
+            resp = session.get(current_url, headers=headers, allow_redirects=False, timeout=30)
+        except Exception as e:
+            localhost_match = re.search(r'(https?://localhost[^\s\'\"]+)', str(e))
+            if localhost_match:
+                code = _extract_code_from_url(localhost_match.group(1))
+                if code:
+                    print(f"[OAuth] follow[{hop + 1}] 命中 localhost 回调")
+                    return code, localhost_match.group(1)
+            print(f"[OAuth] follow[{hop + 1}] 请求异常: {e}")
+            return None, last_url
+
+        last_url = str(getattr(resp, "url", "") or current_url)
+        print(f"[OAuth] follow[{hop + 1}] {resp.status_code} {last_url[:140]}")
+        code = _extract_code_from_url(last_url)
+        if code:
+            return code, last_url
+
+        if resp.status_code not in (301, 302, 303, 307, 308):
+            return None, last_url
+
+        loc = str(resp.headers.get("Location", "") or "").strip()
+        if not loc:
+            return None, last_url
+        if loc.startswith("/"):
+            loc = f"https://auth.openai.com{loc}"
+
+        code = _extract_code_from_url(loc)
+        if code:
+            return code, loc
+
+        current_url = loc
+        headers["Referer"] = last_url
+
+    return None, last_url
+
+
+def _oauth_submit_workspace_and_org(session: Any, consent_url: str, did: str, user_agent: str = UA) -> Optional[str]:
+    session_data = _decode_oauth_session_cookie(session)
+    if not session_data:
+        cookie_names = [getattr(c, "name", "") for c in list(getattr(session.cookies, "jar", []) or [])]
+        print(f"[OAuth] 无法解码 oai-client-auth-session, cookies={cookie_names[:12]}")
+        return None
+
+    workspaces = session_data.get("workspaces", []) or []
+    if not workspaces:
+        print("[OAuth] session 中没有 workspace 信息")
+        return None
+
+    workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
+    if not workspace_id:
+        print("[OAuth] workspace_id 为空")
+        return None
+
+    headers = _oauth_json_headers(consent_url, did, user_agent=user_agent)
+    resp = session.post(
+        "https://auth.openai.com/api/accounts/workspace/select",
+        json={"workspace_id": workspace_id},
+        headers=headers,
+        allow_redirects=False,
+        timeout=30,
+    )
+    print(f"[OAuth] workspace/select -> {resp.status_code}")
+
+    if resp.status_code in (301, 302, 303, 307, 308):
+        loc = str(resp.headers.get("Location", "") or "").strip()
+        if loc.startswith("/"):
+            loc = f"https://auth.openai.com{loc}"
+        code = _extract_code_from_url(loc)
+        if code:
+            return code
+        code, _ = _oauth_follow_for_code(session, loc, referer=consent_url, user_agent=user_agent)
+        return code or _oauth_allow_redirect_extract_code(session, loc, referer=consent_url, user_agent=user_agent)
+
+    if resp.status_code != 200:
+        print(f"[OAuth] workspace/select 失败: {resp.status_code}")
+        return None
+
+    try:
+        ws_data = resp.json() or {}
+    except Exception:
+        print("[OAuth] workspace/select 响应不是 JSON")
+        return None
+
+    ws_next = str(ws_data.get("continue_url") or "").strip()
+    page_payload = ((ws_data.get("page") or {}).get("payload") or {})
+    orgs = (
+        ((ws_data.get("data") or {}).get("orgs"))
+        or (((page_payload.get("data") or {}).get("orgs")))
+        or []
+    )
+    ws_page = str((ws_data.get("page") or {}).get("type") or "")
+    print(f"[OAuth] workspace/select page={ws_page or '-'} next={(ws_next or '-')[:140]}")
+
+    org_id = ""
+    project_id = ""
+    if orgs:
+        org = orgs[0] or {}
+        org_id = str(org.get("id") or "").strip()
+        project_id = str(org.get("default_project_id") or "").strip()
+        if not project_id:
+            projects = org.get("projects") or []
+            if projects:
+                project_id = str((projects[0] or {}).get("id") or "").strip()
+
+    if org_id:
+        org_body = {"org_id": org_id}
+        if project_id:
+            org_body["project_id"] = project_id
+        org_referer = ws_next if ws_next.startswith("http") else (f"https://auth.openai.com{ws_next}" if ws_next.startswith("/") else consent_url)
+        org_headers = _oauth_json_headers(org_referer or consent_url, did, user_agent=user_agent)
+
+        resp_org = session.post(
+            "https://auth.openai.com/api/accounts/organization/select",
+            json=org_body,
+            headers=org_headers,
+            allow_redirects=False,
+            timeout=30,
+        )
+        print(f"[OAuth] organization/select -> {resp_org.status_code}")
+
+        if resp_org.status_code in (301, 302, 303, 307, 308):
+            loc = str(resp_org.headers.get("Location", "") or "").strip()
+            if loc.startswith("/"):
+                loc = f"https://auth.openai.com{loc}"
+            code = _extract_code_from_url(loc)
+            if code:
+                return code
+            code, _ = _oauth_follow_for_code(session, loc, referer=org_referer, user_agent=user_agent)
+            return code or _oauth_allow_redirect_extract_code(session, loc, referer=org_referer, user_agent=user_agent)
+
+        if resp_org.status_code == 200:
+            try:
+                org_data = resp_org.json() or {}
+            except Exception:
+                print("[OAuth] organization/select 响应不是 JSON")
+                return None
+
+            org_next = str(org_data.get("continue_url") or "").strip()
+            org_page = str((org_data.get("page") or {}).get("type") or "")
+            print(f"[OAuth] organization/select page={org_page or '-'} next={(org_next or '-')[:140]}")
+            if org_next:
+                if org_next.startswith("/"):
+                    org_next = f"https://auth.openai.com{org_next}"
+                code, _ = _oauth_follow_for_code(session, org_next, referer=org_referer, user_agent=user_agent)
+                return code or _oauth_allow_redirect_extract_code(session, org_next, referer=org_referer, user_agent=user_agent)
+
+    if ws_next:
+        if ws_next.startswith("/"):
+            ws_next = f"https://auth.openai.com{ws_next}"
+        code, _ = _oauth_follow_for_code(session, ws_next, referer=consent_url, user_agent=user_agent)
+        return code or _oauth_allow_redirect_extract_code(session, ws_next, referer=consent_url, user_agent=user_agent)
+
+    return None
+
+
 def _follow_redirect_chain(session: Any, start_url: str, timeout: int = 15, max_hops: int = 20) -> Dict[str, Any]:
     current_url = str(start_url or "").strip()
     if not current_url:
@@ -1203,6 +1461,10 @@ def submit_callback_url(callback_url: str, expected_state: str, code_verifier: s
     else:
         token_resp = _post_form(TOKEN_URL, token_data)
 
+    return _token_json_from_oauth_response(token_resp)
+
+
+def _token_json_from_oauth_response(token_resp: Dict[str, Any]) -> str:
     access_token = str(token_resp.get("access_token") or "").strip()
     refresh_token = str(token_resp.get("refresh_token") or "").strip()
     id_token = str(token_resp.get("id_token") or "").strip()
@@ -1222,6 +1484,323 @@ def submit_callback_url(callback_url: str, expected_state: str, code_verifier: s
         "expired": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + max(expires_in, 0))),
     }
     return json.dumps(config, ensure_ascii=False, indent=2)
+
+
+def perform_codex_oauth_login_http(
+    email: str,
+    password: str,
+    extract_code_candidates,
+    email_client,
+    proxies: Any = None,
+    user_agent: str = UA,
+    email_timeout: int = 900,
+) -> Optional[str]:
+    print("[OAuth] 开始执行 Codex OAuth 纯协议流程...")
+    session = requests.Session(proxies=proxies, impersonate="chrome")
+    oauth = generate_oauth_url()
+    authorize_params = {
+        key: values[0]
+        for key, values in urllib.parse.parse_qs(urllib.parse.urlparse(oauth.auth_url).query, keep_blank_values=True).items()
+        if values
+    }
+
+    def _bootstrap_oauth_session() -> tuple[bool, str]:
+        print("[OAuth] 1/7 GET /oauth/authorize")
+        try:
+            resp = session.get(
+                oauth.auth_url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://chatgpt.com/",
+                    "Upgrade-Insecure-Requests": "1",
+                    "User-Agent": user_agent,
+                },
+                allow_redirects=True,
+                timeout=30,
+            )
+        except Exception as e:
+            print(f"[OAuth] /oauth/authorize 异常: {e}")
+            return False, ""
+
+        final_url = str(getattr(resp, "url", "") or "")
+        redirects = len(getattr(resp, "history", []) or [])
+        print(f"[OAuth] /oauth/authorize -> {resp.status_code}, final={(final_url or '-')[:140]}, redirects={redirects}")
+
+        has_login = _has_cookie(session, "login_session")
+        print(f"[OAuth] login_session: {'已获取' if has_login else '未获取'}")
+        if has_login:
+            return True, final_url
+
+        print("[OAuth] 未拿到 login_session，尝试访问 oauth2 auth 入口")
+        try:
+            resp2 = session.get(
+                "https://auth.openai.com/api/oauth/oauth2/auth",
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": oauth.auth_url,
+                    "Upgrade-Insecure-Requests": "1",
+                    "User-Agent": user_agent,
+                },
+                params=authorize_params,
+                allow_redirects=True,
+                timeout=30,
+            )
+            final_url = str(getattr(resp2, "url", "") or final_url)
+            redirects2 = len(getattr(resp2, "history", []) or [])
+            print(f"[OAuth] /api/oauth/oauth2/auth -> {resp2.status_code}, final={(final_url or '-')[:140]}, redirects={redirects2}")
+        except Exception as e:
+            print(f"[OAuth] /api/oauth/oauth2/auth 异常: {e}")
+
+        has_login = _has_cookie(session, "login_session")
+        print(f"[OAuth] login_session(重试): {'已获取' if has_login else '未获取'}")
+        return has_login, final_url
+
+    has_login_session, authorize_final_url = _bootstrap_oauth_session()
+    if not authorize_final_url:
+        return None
+
+    did = session.cookies.get("oai-did")
+    if not did:
+        print("[OAuth] 未获取到 oai-did")
+        return None
+    session.cookies.set("oai-did", did, domain=".auth.openai.com")
+    session.cookies.set("oai-did", did, domain="auth.openai.com")
+
+    continue_referer = authorize_final_url if authorize_final_url.startswith("https://auth.openai.com") else "https://auth.openai.com/log-in"
+
+    def _post_authorize_continue(referer_url: str):
+        headers = _oauth_json_headers(referer_url, did, user_agent=user_agent)
+        headers["openai-sentinel-token"] = _build_sentinel_payload(session, did, "authorize_continue")
+        return session.post(
+            "https://auth.openai.com/api/accounts/authorize/continue",
+            json={"username": {"kind": "email", "value": email}},
+            headers=headers,
+            timeout=30,
+            allow_redirects=False,
+        )
+
+    print("[OAuth] 2/7 POST /api/accounts/authorize/continue")
+    try:
+        resp_continue = _post_authorize_continue(continue_referer)
+    except Exception as e:
+        print(f"[OAuth] authorize/continue 异常: {e}")
+        return None
+    print(f"[OAuth] /authorize/continue -> {resp_continue.status_code}")
+
+    if resp_continue.status_code == 400 and "invalid_auth_step" in (resp_continue.text or ""):
+        print("[OAuth] invalid_auth_step，重新 bootstrap 后重试一次")
+        has_login_session, authorize_final_url = _bootstrap_oauth_session()
+        if not authorize_final_url:
+            return None
+        continue_referer = authorize_final_url if authorize_final_url.startswith("https://auth.openai.com") else "https://auth.openai.com/log-in"
+        try:
+            resp_continue = _post_authorize_continue(continue_referer)
+        except Exception as e:
+            print(f"[OAuth] authorize/continue(重试) 异常: {e}")
+            return None
+        print(f"[OAuth] /authorize/continue(重试) -> {resp_continue.status_code}")
+
+    if resp_continue.status_code != 200:
+        print(f"[OAuth] 邮箱提交失败: {resp_continue.text[:180]}")
+        return None
+
+    try:
+        continue_data = resp_continue.json() or {}
+    except Exception:
+        print("[OAuth] authorize/continue 响应解析失败")
+        return None
+
+    continue_url = str(continue_data.get("continue_url") or "").strip()
+    page_type = str((continue_data.get("page") or {}).get("type") or "")
+    print(f"[OAuth] continue page={page_type or '-'} next={(continue_url or '-')[:140]}")
+
+    print("[OAuth] 3/7 POST /api/accounts/password/verify")
+    headers_verify = _oauth_json_headers("https://auth.openai.com/log-in/password", did, user_agent=user_agent)
+    try:
+        headers_verify["openai-sentinel-token"] = _build_sentinel_payload(session, did, "password_verify")
+    except Exception as e:
+        print(f"[OAuth] password_verify 的 sentinel token 获取失败: {e}")
+        return None
+
+    try:
+        resp_verify = session.post(
+            "https://auth.openai.com/api/accounts/password/verify",
+            json={"password": password},
+            headers=headers_verify,
+            timeout=30,
+            allow_redirects=False,
+        )
+    except Exception as e:
+        print(f"[OAuth] password/verify 异常: {e}")
+        return None
+
+    print(f"[OAuth] /password/verify -> {resp_verify.status_code}")
+    if resp_verify.status_code != 200:
+        print(f"[OAuth] 密码校验失败: {resp_verify.text[:180]}")
+        return None
+
+    try:
+        verify_data = resp_verify.json() or {}
+    except Exception:
+        print("[OAuth] password/verify 响应解析失败")
+        return None
+
+    continue_url = str(verify_data.get("continue_url") or continue_url or "").strip()
+    page_type = str((verify_data.get("page") or {}).get("type") or page_type or "")
+    print(f"[OAuth] verify page={page_type or '-'} next={(continue_url or '-')[:140]}")
+
+    need_oauth_otp = (
+        page_type == "email_otp_verification"
+        or "email-verification" in continue_url
+        or "email-otp" in continue_url
+    )
+
+    if need_oauth_otp:
+        print("[OAuth] 4/7 检测到邮箱 OTP 验证")
+        otp_success = False
+        tried_codes: set[str] = set()
+        otp_deadline = time.time() + max(120, email_timeout)
+        otp_headers = _oauth_json_headers("https://auth.openai.com/email-verification", did, user_agent=user_agent)
+
+        while time.time() < otp_deadline and not otp_success:
+            # 登录阶段参考原始实现：不做严格时间窗截断。
+            # 对当前流程来说邮箱地址是本轮新注册生成的，放宽筛选更稳，避免把真正的新 OTP 误滤掉。
+            candidate_items = _sort_otp_candidates(extract_code_candidates())
+            fresh_candidates = [item for item in candidate_items if item.code not in tried_codes]
+            if not fresh_candidates:
+                waited = int(max(0, (max(120, email_timeout)) - (otp_deadline - time.time())))
+                print(f"[OAuth] OTP 等待中... ({waited}s/{max(120, email_timeout)}s)")
+                time.sleep(2)
+                continue
+
+            order_text = ", ".join(
+                f"{item.code}@{datetime.fromtimestamp(item.received_ts).strftime('%H:%M:%S') if item.received_ts else 'unknown'}"
+                for item in fresh_candidates[:5]
+            )
+            print(f"[OAuth] OTP 候选顺序(新->旧): {order_text}")
+
+            for candidate in fresh_candidates:
+                tried_codes.add(candidate.code)
+                print(f"[OAuth] 尝试 OTP: {candidate.code}")
+                try:
+                    resp_otp = session.post(
+                        "https://auth.openai.com/api/accounts/email-otp/validate",
+                        json={"code": candidate.code},
+                        headers=otp_headers,
+                        timeout=30,
+                        allow_redirects=False,
+                    )
+                except Exception as e:
+                    print(f"[OAuth] email-otp/validate 异常: {e}")
+                    continue
+
+                print(f"[OAuth] /email-otp/validate -> {resp_otp.status_code}")
+                if resp_otp.status_code != 200:
+                    print(f"[OAuth] OTP 无效，继续尝试下一条: {resp_otp.text[:160]}")
+                    continue
+
+                try:
+                    otp_data = resp_otp.json() or {}
+                except Exception:
+                    print("[OAuth] email-otp/validate 响应解析失败")
+                    continue
+
+                continue_url = str(otp_data.get("continue_url") or continue_url or "").strip()
+                page_type = str((otp_data.get("page") or {}).get("type") or page_type or "")
+                print(f"[OAuth] OTP 验证通过 page={page_type or '-'} next={(continue_url or '-')[:140]}")
+                otp_success = True
+                if hasattr(email_client, "cleanup_email"):
+                    email_client.cleanup_email(email)
+                break
+
+            if not otp_success:
+                time.sleep(2)
+
+        if not otp_success:
+            print(f"[OAuth] OAuth 阶段 OTP 验证失败，已尝试 {len(tried_codes)} 个验证码")
+            return None
+
+    code = ""
+    consent_url = continue_url
+    if consent_url.startswith("/"):
+        consent_url = f"https://auth.openai.com{consent_url}"
+    if not consent_url and "consent" in page_type:
+        consent_url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+
+    if consent_url:
+        code = _extract_code_from_url(consent_url)
+
+    if not code and consent_url:
+        print("[OAuth] 5/7 跟随 continue_url 提取 code")
+        code, _ = _oauth_follow_for_code(
+            session,
+            consent_url,
+            referer="https://auth.openai.com/log-in/password",
+            user_agent=user_agent,
+        )
+        code = code or ""
+
+    consent_hint = (
+        ("consent" in consent_url)
+        or ("sign-in-with-chatgpt" in consent_url)
+        or ("workspace" in consent_url)
+        or ("organization" in consent_url)
+        or ("consent" in page_type)
+        or ("organization" in page_type)
+    )
+
+    if not code and consent_hint:
+        if not consent_url:
+            consent_url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        print("[OAuth] 6/7 执行 workspace/org 选择")
+        code = _oauth_submit_workspace_and_org(session, consent_url, did, user_agent=user_agent) or ""
+
+    if not code:
+        fallback_consent = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        print("[OAuth] 6/7 回退 consent 路径重试")
+        code = _oauth_submit_workspace_and_org(session, fallback_consent, did, user_agent=user_agent) or ""
+        if not code:
+            code, _ = _oauth_follow_for_code(
+                session,
+                fallback_consent,
+                referer="https://auth.openai.com/log-in/password",
+                user_agent=user_agent,
+            )
+            code = code or ""
+
+    if not code:
+        print("[OAuth] 未获取到 authorization code")
+        return None
+
+    print("[OAuth] 7/7 POST /oauth/token")
+    token_resp = session.post(
+        "https://auth.openai.com/oauth/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": user_agent},
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": oauth.redirect_uri,
+            "client_id": CLIENT_ID,
+            "code_verifier": oauth.code_verifier,
+        },
+        timeout=60,
+    )
+    print(f"[OAuth] /oauth/token -> {token_resp.status_code}")
+    if token_resp.status_code != 200:
+        print(f"[OAuth] token 交换失败: {token_resp.status_code} {token_resp.text[:200]}")
+        return None
+
+    try:
+        token_data = token_resp.json() or {}
+    except Exception:
+        print("[OAuth] token 响应解析失败")
+        return None
+
+    if not token_data.get("access_token"):
+        print("[OAuth] token 响应缺少 access_token")
+        return None
+
+    return _token_json_from_oauth_response(token_data)
 
 
 def _sub2api_login(settings: Dict[str, Any]) -> str:
@@ -1968,280 +2547,24 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
             return None
 
         print("[步骤9] 注册完成，重新走登录流程获取 Workspace / Token...")
-        first_code = code
         for login_attempt in range(3):
             try:
                 print(f"[*] 正在通过登录流程获取 Token...{f' (重试 {login_attempt}/3)' if login_attempt else ''}")
-                s2 = requests.Session(proxies=proxies, impersonate="chrome")
-                oauth2 = generate_oauth_url()
-                s2.get(oauth2.auth_url, timeout=15)
-                did2 = s2.cookies.get("oai-did")
-                if not did2:
-                    print("[失败] 登录会话未能获取 oai-did")
-                    continue
-
-                lc = s2.post(
-                    "https://auth.openai.com/api/accounts/authorize/continue",
-                    headers={
-                        "referer": "https://auth.openai.com/log-in",
-                        "accept": "application/json",
-                        "content-type": "application/json",
-                        "openai-sentinel-token": _build_sentinel_payload(s2, did2, "authorize_continue"),
-                    },
-                    data=json.dumps({"username": {"value": email, "kind": "email"}, "screen_hint": "login"}),
-                    timeout=15,
+                token_json = perform_codex_oauth_login_http(
+                    email=email,
+                    password=password,
+                    extract_code_candidates=extract_code_candidates,
+                    email_client=email_client,
+                    proxies=proxies,
+                    user_agent=UA,
+                    email_timeout=email_timeout,
                 )
-                print(f"[日志] 登录邮箱提交状态: {lc.status_code}")
-                if lc.status_code != 200:
-                    print(f"[失败] 登录邮箱提交失败: {lc.text[:200]}")
-                    continue
-                s2.get(str((lc.json() or {}).get("continue_url") or ""), timeout=15)
-
-                pw = s2.post(
-                    "https://auth.openai.com/api/accounts/password/verify",
-                    headers={
-                        "referer": "https://auth.openai.com/log-in/password",
-                        "accept": "application/json",
-                        "content-type": "application/json",
-                        "openai-sentinel-token": _build_sentinel_payload(s2, did2, "authorize_continue"),
-                    },
-                    json={"password": password},
-                    timeout=15,
-                )
-                print(f"[日志] 登录密码验证状态: {pw.status_code}")
-                if pw.status_code != 200:
-                    print(f"[失败] 登录密码验证失败: {pw.text[:200]}")
-                    continue
-
-                # 登录阶段只依赖“本次 OTP 会话开始时间”过滤旧邮件；
-                # 不再按纯 code 做基线排除，因为登录码可能与注册码重复。
-                attempted_codes: set[str] = set()
-
-                # 进入邮件验证页后，OpenAI 通常会自动发送一封登录 OTP。
-                # 这里先依赖自动发送，避免“页面自动发一封 + 主动接口再发一封”导致同时出现两条验证码。
-                otp_send_time = time.time()  # 记录本次登录 OTP 会话开始时间，用于过滤更早流程里的旧邮件
-                s2.get(
-                    "https://auth.openai.com/email-verification",
-                    headers={"referer": "https://auth.openai.com/log-in/password"},
-                    timeout=15,
-                )
-
-                print(f"[*] 正在等待登录 OTP（超时 {email_timeout}s，每 {otp_resend_interval}s 无码自动重发）...")
-                # 等待几秒让邮件到达 IMAP
-                time.sleep(8)
-
-                otp2 = None
-                otp_start = time.monotonic()
-                otp_last_send = otp_start
-                otp_attempt = 0
-                val2_data = {}
-                initial_send_requested = False
-                
-                while time.monotonic() - otp_start < email_timeout:
-                    otp_attempt += 1
-                    all_candidates = _sort_otp_candidates(
-                        extract_code_candidates(min_received_ts=otp_send_time, time_skew_sec=0.0)
-                    )
-                    # 只接受本次登录 OTP 会话时间窗内的候选，并按收到时间从新到旧去重
-                    new_candidates: List[OtpCandidate] = []
-                    seen_codes = set()
-                    for candidate in all_candidates:
-                        if candidate.code in attempted_codes or candidate.code in seen_codes:
-                            continue
-                        seen_codes.add(candidate.code)
-                        new_candidates.append(candidate)
-                    if new_candidates:
-                        order_text = ", ".join(
-                            f"{item.code}@{datetime.fromtimestamp(item.received_ts).strftime('%H:%M:%S') if item.received_ts else 'unknown'}"
-                            for item in new_candidates[:5]
-                        )
-                        print(f"[otp-login] 候选顺序(新->旧): {order_text}")
-                    
-                    session_locked = False
-                    for candidate in new_candidates:
-                        candidate_code = candidate.code
-                        print(f"[*] 发现候选登录 OTP {candidate_code}，正在尝试校验...")
-                        val2 = s2.post(
-                            "https://auth.openai.com/api/accounts/email-otp/validate",
-                            headers={
-                                "referer": "https://auth.openai.com/email-verification",
-                                "accept": "application/json",
-                                "content-type": "application/json",
-                            },
-                            json={"code": candidate_code},
-                            timeout=15,
-                        )
-                        print(f"[日志] 登录 OTP 校验状态: {val2.status_code}")
-                        if val2.status_code == 200:
-                            print(f"[成功] 登录 OTP {candidate_code} 验证成功")
-                            otp2 = candidate_code
-                            val2_data = val2.json() or {}
-                            if hasattr(email_client, "cleanup_email"):
-                                email_client.cleanup_email(email)
-                            break
-                        else:
-                            err_code = (val2.json() or {}).get("error", {}).get("code", "")
-                            if err_code == "max_check_attempts":
-                                print(f"[警告] 校验次数超限(max_check_attempts)，OTP会话已锁定，放弃本轮等待！")
-                                attempted_codes.add(candidate_code)
-                                session_locked = True
-                                break
-                            else:
-                                print(f"[警告] OTP {candidate_code} 校验失败(可能过期)，加入黑名单继续等待: {val2.text[:100]}")
-                                attempted_codes.add(candidate_code)
-                            
-                    if otp2 or session_locked:
-                        break
-
-                    elapsed = int(time.monotonic() - otp_start)
-                    if (
-                        not initial_send_requested
-                        and not new_candidates
-                        and elapsed >= LOGIN_OTP_INITIAL_SEND_GRACE_SEC
-                    ):
-                        print(
-                            f"[otp-login] {LOGIN_OTP_INITIAL_SEND_GRACE_SEC}s 内未收到自动发送的 OTP，主动触发一次发送..."
-                        )
-                        try:
-                            rr_init = s2.get(
-                                "https://auth.openai.com/api/accounts/email-otp/send",
-                                headers={"referer": "https://auth.openai.com/email-verification", "accept": "application/json"},
-                                timeout=15,
-                            )
-                            print(f"[otp-login] 首次主动发送状态: {rr_init.status_code}")
-                            s2.get("https://auth.openai.com/email-verification", timeout=15)
-                        except Exception as _re_init:
-                            print(f"[otp-login] 首次主动发送失败: {_re_init}")
-                        otp_last_send = time.monotonic()
-                        initial_send_requested = True
-
-                    # 超过重发间隔则重新触发 OTP 发送
-                    if time.monotonic() - otp_last_send >= otp_resend_interval:
-                        print(f"[otp-login] {otp_resend_interval}s 未收到有效 OTP，重新触发发送...")
-                        try:
-                            rr2 = s2.get(
-                                "https://auth.openai.com/api/accounts/email-otp/send",
-                                headers={"referer": "https://auth.openai.com/email-verification", "accept": "application/json"},
-                                timeout=15,
-                            )
-                            print(f"[otp-login] 重发状态: {rr2.status_code}")
-                            s2.get("https://auth.openai.com/email-verification", timeout=15)
-                        except Exception as _re2:
-                            print(f"[otp-login] 重发失败: {_re2}")
-                        otp_last_send = time.monotonic()
-                        
-                    print(f"[otp-login] 轮询 #{otp_attempt} ({elapsed}s/{email_timeout}s), 还未收到新 OTP...")
-                    time.sleep(8)
-
-                if not otp2:
-                    print("[失败] 最终未能收到并验证有效的登录 OTP")
-                    continue
-
-                consent_url = str(val2_data.get("continue_url") or "").strip()
-                if consent_url:
-                    s2.get(consent_url, timeout=15)
-
-                auth_cookie = s2.cookies.get("oai-client-auth-session", domain=".auth.openai.com") or s2.cookies.get("oai-client-auth-session")
-                if not auth_cookie:
-                    print("[失败] 登录后未能获取 oai-client-auth-session")
-                    continue
-                auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
-
-                workspace_id = ""
-                sel_data = {}
-
-                if auth_json.get("workspaces"):
-                    workspace_id = auth_json["workspaces"][0]["id"]
-                    print(f"[成功] Workspace ID (from cookie): {workspace_id}")
-                else:
-                    # 新账号：cookie 里还没有 workspaces，用空 body 让 OpenAI 返回默认 workspace
-                    print(f"[*] Cookie 中无 workspaces（新账号），尝试 workspace/select 空 body... 字段: {list(auth_json.keys())}")
-                    try:
-                        ws_resp = s2.post(
-                            "https://auth.openai.com/api/accounts/workspace/select",
-                            headers={"referer": consent_url or "https://auth.openai.com/", "accept": "application/json", "content-type": "application/json"},
-                            json={},
-                            timeout=15,
-                        )
-                        print(f"[日志] workspace/select(空) 状态: {ws_resp.status_code} | body: {ws_resp.text[:300]}")
-                        ws_data = ws_resp.json() if ws_resp.status_code == 200 else {}
-                        if ws_data.get("continue_url") or ws_data.get("page", {}).get("type") == "organization_select":
-                            sel_data = ws_data
-                            workspace_id = "__from_empty_select__"
-                        else:
-                            print("[失败] workspace/select(空) 未返回 continue_url，放弃本轮")
-                            continue
-                    except Exception as _we:
-                        print(f"[失败] workspace/select(空) 异常: {_we}")
-                        continue
-
-                if workspace_id and workspace_id != "__from_empty_select__":
-                    print(f"[成功] Workspace ID: {workspace_id}")
-                    select_resp = s2.post(
-                        "https://auth.openai.com/api/accounts/workspace/select",
-                        headers={"referer": consent_url, "accept": "application/json", "content-type": "application/json"},
-                        json={"workspace_id": workspace_id},
-                        timeout=15,
-                    )
-                    print(f"[日志] Workspace 选择状态: {select_resp.status_code}")
-                    if select_resp.status_code != 200:
-                        print(f"[失败] Workspace 选择失败: {select_resp.text[:200]}")
-                        continue
-                    sel_data = select_resp.json() or {}
-
-
-                if sel_data.get("page", {}).get("type", "") == "organization_select":
-                    orgs = sel_data.get("page", {}).get("payload", {}).get("data", {}).get("orgs", [])
-                    if orgs:
-                        org_sel = s2.post(
-                            "https://auth.openai.com/api/accounts/organization/select",
-                            headers={"accept": "application/json", "content-type": "application/json"},
-                            json={
-                                "org_id": orgs[0].get("id", ""),
-                                "project_id": orgs[0].get("default_project_id", ""),
-                            },
-                            timeout=15,
-                        )
-                        print(f"[日志] Organization 选择状态: {org_sel.status_code}")
-                        if org_sel.status_code != 200:
-                            print(f"[失败] Organization 选择失败: {org_sel.text[:200]}")
-                            continue
-                        sel_data = org_sel.json() or {}
-
-                if "continue_url" not in sel_data:
-                    print(f"[失败] 未能获取 continue_url: {json.dumps(sel_data, ensure_ascii=False)[:500]}")
-                    continue
-
-                print("[步骤10] 跟踪重定向并换取 Token...")
-                r = s2.get(str(sel_data["continue_url"]), allow_redirects=False, timeout=15)
-                cbk = None
-                for i in range(20):
-                    loc = r.headers.get("Location", "")
-                    print(f"  -> 重定向 #{i+1} 状态: {r.status_code} | 下一跳: {loc[:80] if loc else '无'}")
-                    if loc.startswith("http://localhost"):
-                        cbk = loc
-                        break
-                    if r.status_code not in (301, 302, 303) or not loc:
-                        break
-                    r = s2.get(loc, allow_redirects=False, timeout=15)
-
-                if not cbk:
-                    print("[失败] 未能获取到 Callback URL")
-                    continue
-
-                token_json = submit_callback_url(
-                    callback_url=cbk,
-                    expected_state=oauth2.state,
-                    code_verifier=oauth2.code_verifier,
-                    redirect_uri=oauth2.redirect_uri,
-                    session=s2,
-                )
-                print("[大功告成] 账号注册完毕！")
-                return token_json, email, password
+                if token_json:
+                    print("[大功告成] 账号注册完毕！")
+                    return token_json, email, password
             except Exception as e:
                 print(f"[失败] 登录补全流程异常: {e}")
-                time.sleep(2)
-                continue
+            time.sleep(2)
 
         print("[失败] 登录补全流程 3 次均未完成。")
         return None
