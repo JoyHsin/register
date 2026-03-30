@@ -2138,181 +2138,48 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                     continue
 
                 consent_url = str(val2_data.get("continue_url") or "").strip()
-                consent_data = {}
                 if consent_url:
-                    consent_resp = s2.get(consent_url, timeout=15)
-                    print(f"[日志] consent_url 状态: {consent_resp.status_code} | url: {consent_url[:200]}")
-                    print(f"[日志] consent_url 响应摘要: {consent_resp.text[:500]}")
-                    try:
-                        consent_data = consent_resp.json() or {}
-                        print(f"[日志] consent_url JSON keys: {list(consent_data.keys())}")
-                    except Exception:
-                        consent_data = {}
-                        print("[日志] consent_url 不是 JSON 响应")
+                    s2.get(consent_url, timeout=15)
 
-                consent_page_type = str((val2_data.get("page") or {}).get("type") or "")
-                needs_about_you = (
-                    consent_page_type == "about_you"
-                    or "/about-you" in consent_url
-                )
-                if needs_about_you:
-                    print("[*] 登录后仍落在 about-you，尝试在当前登录会话补完账户信息...")
-                    try:
-                        login_create_account_sentinel = _build_sentinel_payload(s2, did2, "authorize_continue")
-                        login_acc_res = s2.post(
-                            "https://auth.openai.com/api/accounts/create_account",
-                            headers={
-                                "referer": "https://auth.openai.com/about-you",
-                                "accept": "application/json",
-                                "content-type": "application/json",
-                                "openai-sentinel-token": login_create_account_sentinel,
-                            },
-                            data=json.dumps({"name": _random_name(), "birthdate": _random_birthdate()}),
-                            timeout=15,
-                        )
-                        print(f"[日志] 登录补完 about-you 状态: {login_acc_res.status_code} | body: {login_acc_res.text[:500]}")
-                        if login_acc_res.status_code == 200:
-                            try:
-                                login_acc_data = login_acc_res.json() or {}
-                            except Exception:
-                                login_acc_data = {}
-                            if login_acc_data:
-                                print(f"[日志] 登录补完 about-you JSON keys: {list(login_acc_data.keys())}")
-                            next_url = str(login_acc_data.get("continue_url") or "").strip()
-                            if next_url:
-                                consent_url = next_url
-                                print(f"[日志] about-you 后新的 continue_url: {consent_url}")
-                                consent_resp = s2.get(consent_url, timeout=15)
-                                print(f"[日志] 新 consent_url 状态: {consent_resp.status_code} | url: {consent_url[:200]}")
-                                print(f"[日志] 新 consent_url 响应摘要: {consent_resp.text[:500]}")
-                                try:
-                                    consent_data = consent_resp.json() or {}
-                                    print(f"[日志] 新 consent_url JSON keys: {list(consent_data.keys())}")
-                                except Exception:
-                                    consent_data = {}
-                                    print("[日志] 新 consent_url 不是 JSON 响应")
-                    except Exception as _about_you_ex:
-                        print(f"[日志] 登录补完 about-you 异常: {_about_you_ex}")
-
-                auth_json = _get_auth_cookie_payload(s2)
-                if not auth_json:
+                auth_cookie = s2.cookies.get("oai-client-auth-session", domain=".auth.openai.com") or s2.cookies.get("oai-client-auth-session")
+                if not auth_cookie:
                     print("[失败] 登录后未能获取 oai-client-auth-session")
                     continue
-                print(f"[日志] auth_cookie 字段: {list(auth_json.keys())}")
+                auth_json = _decode_jwt_segment(auth_cookie.split(".")[0])
 
-                if needs_about_you or not auth_json.get("workspaces"):
-                    print("[*] 当前登录会话仍未就绪，尝试稳定化等待 workspace / consent ...")
-                    settled = _stabilize_login_session(
-                        s2,
-                        oauth2.auth_url,
-                        consent_url,
-                        timeout_sec=LOGIN_WORKSPACE_SETTLE_TIMEOUT_SEC,
-                        poll_sec=LOGIN_WORKSPACE_SETTLE_POLL_SEC,
-                    )
-                    direct_cbk = str(settled.get("callback_url") or "").strip()
-                    if direct_cbk:
-                        token_json = submit_callback_url(
-                            callback_url=direct_cbk,
-                            expected_state=oauth2.state,
-                            code_verifier=oauth2.code_verifier,
-                            redirect_uri=oauth2.redirect_uri,
-                            session=s2,
-                        )
-                        print("[大功告成] 账号注册完毕！(登录会话稳定化后直跳 callback)")
-                        return token_json, email, password
-                    consent_url = str(settled.get("consent_url") or consent_url or "").strip()
-                    if settled.get("consent_data"):
-                        consent_data = settled.get("consent_data") or {}
-                    if settled.get("auth_json"):
-                        auth_json = settled.get("auth_json") or auth_json
-                    print(f"[日志] 稳定化后 auth_cookie 字段: {list(auth_json.keys())}")
-
-                # ── workspace 获取（四层兜底）──────────────────────────────
                 workspace_id = ""
                 sel_data = {}
 
-                # 层1：从 cookie 读（老账号正常路径）
                 if auth_json.get("workspaces"):
                     workspace_id = auth_json["workspaces"][0]["id"]
                     print(f"[成功] Workspace ID (from cookie): {workspace_id}")
-
-                # 层2：consent_url 响应 JSON 里直接含 workspace 信息
-                if not workspace_id:
-                    ws_from_consent = (
-                        (consent_data.get("page") or {}).get("payload") or {}
-                    ).get("workspace_id") or (consent_data.get("workspace_id") or "")
-                    if ws_from_consent:
-                        workspace_id = str(ws_from_consent).strip()
-                        print(f"[成功] Workspace ID (from consent response): {workspace_id}")
-
-                # 层3：POST workspace/select 不带 ID，让 OpenAI 返回默认 workspace / continue_url
-                if not workspace_id:
-                    print("[*] Cookie 无 workspaces（新账号），尝试直接调用 workspace/select...")
+                else:
+                    # 新账号：cookie 里还没有 workspaces，用空 body 让 OpenAI 返回默认 workspace
+                    print(f"[*] Cookie 中无 workspaces（新账号），尝试 workspace/select 空 body... 字段: {list(auth_json.keys())}")
                     try:
                         ws_resp = s2.post(
                             "https://auth.openai.com/api/accounts/workspace/select",
-                            headers={
-                                "referer": consent_url or "https://auth.openai.com/",
-                                "accept": "application/json",
-                                "content-type": "application/json",
-                            },
+                            headers={"referer": consent_url or "https://auth.openai.com/", "accept": "application/json", "content-type": "application/json"},
                             json={},
                             timeout=15,
                         )
                         print(f"[日志] workspace/select(空) 状态: {ws_resp.status_code} | body: {ws_resp.text[:300]}")
                         ws_data = ws_resp.json() if ws_resp.status_code == 200 else {}
-                        if ws_data:
-                            print(f"[日志] workspace/select(空) JSON keys: {list(ws_data.keys())}")
-                        if ws_data.get("continue_url"):
+                        if ws_data.get("continue_url") or ws_data.get("page", {}).get("type") == "organization_select":
                             sel_data = ws_data
-                            workspace_id = "__skip__"
-                        elif ws_data.get("page", {}).get("type") == "organization_select":
-                            sel_data = ws_data
-                            workspace_id = "__skip__"
+                            workspace_id = "__from_empty_select__"
+                        else:
+                            print("[失败] workspace/select(空) 未返回 continue_url，放弃本轮")
+                            continue
                     except Exception as _we:
-                        print(f"[*] workspace/select(空) 失败: {_we}")
+                        print(f"[失败] workspace/select(空) 异常: {_we}")
+                        continue
 
-                # 层4：兜底 —— 直接跟踪 consent_url 的重定向链，碰运气找到 localhost callback
-                if not workspace_id:
-                    print("[*] 尝试直接跟踪 consent_url 重定向链获取 OAuth callback...")
-                    cbk = None
-                    try:
-                        r0 = s2.get(consent_url, allow_redirects=False, timeout=15)
-                        for _i in range(20):
-                            loc0 = r0.headers.get("Location", "")
-                            print(f"  -> [兜底] 重定向 #{_i+1} 状态: {r0.status_code} | 下一跳: {loc0[:80] if loc0 else '无'}")
-                            if loc0.startswith("http://localhost"):
-                                cbk = loc0
-                                break
-                            if r0.status_code not in (301, 302, 303) or not loc0:
-                                break
-                            r0 = s2.get(loc0, allow_redirects=False, timeout=15)
-                    except Exception as _cbk_ex:
-                        print(f"[*] 跟踪重定向链异常: {_cbk_ex}")
-                        cbk = None
-                        
-                    if cbk:
-                        token_json = submit_callback_url(
-                            callback_url=cbk, expected_state=oauth2.state,
-                            code_verifier=oauth2.code_verifier, redirect_uri=oauth2.redirect_uri, session=s2,
-                        )
-                        print("[大功告成] 账号注册完毕！(consent 直跳 callback)")
-                        return token_json, email, password
-
-                    print(f"[失败] 无法获取 Workspace ID，Cookie 字段: {list(auth_json.keys())}")
-                    continue
-                # ─────────────────────────────────────────────────────────
-
-                # 已有 workspace_id 且还没拿到 sel_data，走正常 workspace/select 流程
-                if workspace_id != "__skip__":
+                if workspace_id and workspace_id != "__from_empty_select__":
                     print(f"[成功] Workspace ID: {workspace_id}")
                     select_resp = s2.post(
                         "https://auth.openai.com/api/accounts/workspace/select",
-                        headers={
-                            "referer": consent_url,
-                            "accept": "application/json",
-                            "content-type": "application/json",
-                        },
+                        headers={"referer": consent_url, "accept": "application/json", "content-type": "application/json"},
                         json={"workspace_id": workspace_id},
                         timeout=15,
                     )
@@ -2321,7 +2188,7 @@ def run(proxy: Optional[str], mail_provider: str = "auto", email_timeout: int = 
                         print(f"[失败] Workspace 选择失败: {select_resp.text[:200]}")
                         continue
                     sel_data = select_resp.json() or {}
-                    print(f"[日志] Workspace 选择响应: {json.dumps(sel_data, ensure_ascii=False)[:500]}")
+
 
                 if sel_data.get("page", {}).get("type", "") == "organization_select":
                     orgs = sel_data.get("page", {}).get("payload", {}).get("data", {}).get("orgs", [])
